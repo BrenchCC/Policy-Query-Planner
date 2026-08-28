@@ -27,12 +27,15 @@ from data_preprocess.config import (
     PROCESSED_ROOT,
     RANDOM_SEED,
     TARGET_COUNTS,
+    GRPO_HOP_MINIMUM,
+    MULTIHOP_COLD_START_HOP_QUOTAS,
     PLANNER_SYSTEM_PROMPT
 )
 from data_preprocess.schemas import (
     serialize_plan,
     validate_sft_record,
     validate_dpo_record,
+    validate_multihop_sft_record,
     validate_grpo_record
 )
 
@@ -454,42 +457,145 @@ def json_query(plan: str) -> str:
     return json.loads(plan)["queries"][0]["query"]
 
 
-def allocate_grpo_records(
+def musique_question_key(record: dict[str, Any]) -> str:
+    """Build a normalized MuSiQue question fingerprint.
+
+    Args:
+        record: Clean MuSiQue record.
+
+    Returns:
+        Normalized question fingerprint.
+    """
+    return normalized_key(record["question"])
+
+
+def proportional_allocations(
+    groups: dict[int, list[dict[str, Any]]],
+    target_count: int,
+    minimum_per_hop: int
+) -> dict[int, int]:
+    """Allocate a target across hop groups with minimum coverage.
+
+    Args:
+        groups: Remaining records grouped by hop count.
+        target_count: Exact number of records to allocate.
+        minimum_per_hop: Minimum records required from every hop group.
+
+    Returns:
+        Exact per-hop allocation.
+
+    Raises:
+        ValueError: If the groups cannot satisfy the requested allocation.
+    """
+    hop_counts = [2, 3, 4]
+    minimum_total = minimum_per_hop * len(hop_counts)
+    if target_count < minimum_total:
+        raise ValueError("Target count is smaller than the per-hop minimum total")
+    for hop_count in hop_counts:
+        if len(groups[hop_count]) < minimum_per_hop:
+            raise ValueError(f"Insufficient {hop_count}-hop records for minimum allocation")
+
+    allocations = {hop_count: minimum_per_hop for hop_count in hop_counts}
+    remaining_target = target_count - minimum_total
+    capacities = {
+        hop_count: len(groups[hop_count]) - minimum_per_hop
+        for hop_count in hop_counts
+    }
+    total_capacity = sum(capacities.values())
+    if remaining_target > total_capacity:
+        raise ValueError("Insufficient records for proportional allocation")
+    if remaining_target == 0:
+        return allocations
+
+    fractions = []
+    for hop_count in hop_counts:
+        exact = remaining_target * capacities[hop_count] / total_capacity
+        base = min(capacities[hop_count], math.floor(exact))
+        allocations[hop_count] += base
+        fractions.append((exact - base, hop_count))
+    unallocated = target_count - sum(allocations.values())
+    fractions.sort(key = lambda item: (-item[0], item[1]))
+    while unallocated:
+        progress = False
+        for _, hop_count in fractions:
+            if allocations[hop_count] < len(groups[hop_count]):
+                allocations[hop_count] += 1
+                unallocated -= 1
+                progress = True
+                if unallocated == 0:
+                    break
+        if not progress:
+            raise ValueError("Unable to finish proportional allocation")
+    return allocations
+
+
+def allocate_multihop_records(
     records: list[dict[str, Any]],
-    target_count: int
-) -> list[dict[str, Any]]:
-    """Sample MuSiQue by hop distribution with a per-hop minimum.
+    cold_start_quotas: dict[int, int],
+    grpo_target_count: int,
+    seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, int]]:
+    """Jointly allocate disjoint cold-start and GRPO MuSiQue records.
 
     Args:
         records: MuSiQue training records.
-        target_count: Exact requested sample count.
+        cold_start_quotas: Exact 2/3/4-hop cold-start quotas.
+        grpo_target_count: Exact requested GRPO count.
+        seed: Deterministic sampling seed.
 
     Returns:
-        Stratified multi-hop samples.
+        Cold-start records, GRPO records, and GRPO hop allocations.
+
+    Raises:
+        ValueError: If inputs are duplicated or capacity is insufficient.
     """
     groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    seen_source_ids = set()
+    seen_question_keys = set()
     for record in records:
-        if record["hop_count"] in {2, 3, 4}:
-            groups[record["hop_count"]].append(record)
-    base_count = 500
-    selected = []
-    remaining_pool = []
-    random_generator = random.Random(RANDOM_SEED + 5)
+        if record["hop_count"] not in {2, 3, 4}:
+            continue
+        source_id = record["id"]
+        question_key = musique_question_key(record)
+        if source_id in seen_source_ids:
+            raise ValueError(f"Duplicate MuSiQue source ID: {source_id}")
+        seen_source_ids.add(source_id)
+        if question_key in seen_question_keys:
+            continue
+        seen_question_keys.add(question_key)
+        groups[record["hop_count"]].append(record)
+
+    cold_start_records = []
+    remaining_groups: dict[int, list[dict[str, Any]]] = {}
     for hop_count in [2, 3, 4]:
-        random_generator.shuffle(groups[hop_count])
-        selected.extend(groups[hop_count][:base_count])
-        remaining_pool.extend(groups[hop_count][base_count:])
-    remaining_target = target_count - len(selected)
-    selected.extend(
-        stratified_sample(
-            remaining_pool,
-            remaining_target,
-            lambda record: record["hop_count"],
-            RANDOM_SEED + 6
-        )
+        random.Random(seed + hop_count).shuffle(groups[hop_count])
+        cold_count = cold_start_quotas[hop_count]
+        required_count = cold_count + GRPO_HOP_MINIMUM
+        if len(groups[hop_count]) < required_count:
+            raise ValueError(f"Insufficient {hop_count}-hop MuSiQue records")
+        cold_start_records.extend(groups[hop_count][:cold_count])
+        remaining_groups[hop_count] = groups[hop_count][cold_count:]
+
+    grpo_allocations = proportional_allocations(
+        remaining_groups,
+        grpo_target_count,
+        GRPO_HOP_MINIMUM
     )
-    random_generator.shuffle(selected)
-    return selected
+    grpo_records = []
+    for hop_count in [2, 3, 4]:
+        grpo_records.extend(remaining_groups[hop_count][:grpo_allocations[hop_count]])
+
+    random.Random(seed + 10).shuffle(cold_start_records)
+    random.Random(seed + 11).shuffle(grpo_records)
+    cold_source_ids = {record["id"] for record in cold_start_records}
+    grpo_source_ids = {record["id"] for record in grpo_records}
+    if cold_source_ids.intersection(grpo_source_ids):
+        raise ValueError("Cold-start and GRPO source IDs overlap")
+    cold_question_keys = {musique_question_key(record) for record in cold_start_records}
+    grpo_question_keys = {musique_question_key(record) for record in grpo_records}
+    if cold_question_keys.intersection(grpo_question_keys):
+        raise ValueError("Cold-start and GRPO question fingerprints overlap")
+    return cold_start_records, grpo_records, grpo_allocations
 
 
 def convert_musique_plan(record: dict[str, Any]) -> str:
@@ -505,7 +611,15 @@ def convert_musique_plan(record: dict[str, Any]) -> str:
     for step in record["question_decomposition"]:
         step_number = int(step["step"])
         query = step["question"].replace(">>", " ")
-        references = sorted({int(value) for value in re.findall(r"#(\d+)", query)})
+        # Only earlier step numbers are dependencies; titles such as "#9 Dream" stay literal.
+        # 仅将前序步骤编号视为依赖，避免把作品名中的 #9 误解析为 q9。
+        references = sorted(
+            {
+                int(value)
+                for value in re.findall(r"#(\d+)", query)
+                if 1 <= int(value) < step_number
+            }
+        )
         dependencies = []
         for reference in references:
             dependency = f"q{reference}"
@@ -521,18 +635,49 @@ def convert_musique_plan(record: dict[str, Any]) -> str:
     return serialize_plan(queries)
 
 
-def build_grpo_records(musique_train: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build the exact 5K direct MuSiQue GRPO baseline.
+def build_multihop_sft_records(
+    selected_records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build supervised multi-hop cold-start records.
 
     Args:
-        musique_train: Clean MuSiQue training records.
+        selected_records: Disjoint MuSiQue records selected for cold-start.
+
+    Returns:
+        Validated multi-hop SFT cold-start records.
+    """
+    cold_start_records = []
+    for record in selected_records:
+        cold_start_record = {
+            "id": "sft_musique_cold_start_" + record["id"],
+            "instruction": GRPO_INSTRUCTION,
+            "input": f"Question:\n{record['question']}",
+            "output": convert_musique_plan(record),
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "musique",
+            "source_id": record["id"],
+            "sample_type": "musique_multihop_cold_start",
+            "namespace": "musique_aux",
+            "hop_count": record["hop_count"]
+        }
+        validate_multihop_sft_record(cold_start_record)
+        cold_start_records.append(cold_start_record)
+    if len(cold_start_records) != TARGET_COUNTS["sft_multihop_cold_start"]:
+        raise ValueError(f"Unexpected multi-hop SFT count: {len(cold_start_records)}")
+    return cold_start_records
+
+
+def build_grpo_records(selected_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build the exact 5K disjoint MuSiQue GRPO baseline.
+
+    Args:
+        selected_records: Disjoint MuSiQue records selected for GRPO.
 
     Returns:
         Validated GRPO-compatible records.
     """
-    selected = allocate_grpo_records(musique_train, TARGET_COUNTS["grpo"])
     grpo_records = []
-    for record in selected:
+    for record in selected_records:
         grpo_record = {
             "id": "grpo_" + record["id"],
             "instruction": GRPO_INSTRUCTION,
@@ -598,6 +743,15 @@ def write_dataset_info() -> None:
                 "system": "system"
             }
         },
+        "policy_query_multihop_sft_cold_start": {
+            "file_name": "train/sft_multihop_cold_start.jsonl",
+            "columns": {
+                "prompt": "instruction",
+                "query": "input",
+                "response": "output",
+                "system": "system"
+            }
+        },
         "policy_query_grpo_reference": {
             "file_name": "train/grpo_train.jsonl",
             "columns": {
@@ -644,9 +798,20 @@ def main() -> None:
 
     sft_records, policy_plans = build_sft_records(qrecc_train, conditional_train)
     dpo_records = build_dpo_records(qrecc_train, conditional_train, policy_plans)
-    grpo_records = build_grpo_records(musique_train)
+    cold_sources, grpo_sources, grpo_allocations = allocate_multihop_records(
+        musique_train,
+        MULTIHOP_COLD_START_HOP_QUOTAS,
+        TARGET_COUNTS["grpo"],
+        RANDOM_SEED + 5
+    )
+    cold_start_records = build_multihop_sft_records(cold_sources)
+    grpo_records = build_grpo_records(grpo_sources)
 
     write_jsonl(PROCESSED_ROOT / "train" / "sft_train.jsonl", sft_records)
+    write_jsonl(
+        PROCESSED_ROOT / "train" / "sft_multihop_cold_start.jsonl",
+        cold_start_records
+    )
     write_jsonl(PROCESSED_ROOT / "train" / "dpo_train.jsonl", dpo_records)
     write_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl", grpo_records)
     eval_counts = export_evaluation_sets()
@@ -658,15 +823,43 @@ def main() -> None:
             qrecc_train_before_filter - len(qrecc_train)
         ),
         "sft_source_counts": dict(Counter(record["sample_type"] for record in sft_records)),
+        "multihop_cold_start_count": len(cold_start_records),
+        "multihop_cold_start_hop_counts": dict(
+            Counter(str(record["hop_count"]) for record in cold_start_records)
+        ),
         "dpo_count": len(dpo_records),
         "dpo_source_counts": dict(Counter(record["source_dataset"] for record in dpo_records)),
         "dpo_error_counts": dict(Counter(record["error_type"] for record in dpo_records)),
         "grpo_count": len(grpo_records),
         "grpo_hop_counts": dict(Counter(str(record["hop_count"]) for record in grpo_records)),
+        "grpo_hop_allocations": {
+            str(hop_count): count
+            for hop_count, count in grpo_allocations.items()
+        },
+        "cold_start_grpo_source_overlap": len(
+            {record["source_id"] for record in cold_start_records}.intersection(
+                record["source_id"] for record in grpo_records
+            )
+        ),
+        "cold_start_grpo_question_overlap": len(
+            {
+                musique_question_key(record)
+                for record in cold_sources
+            }.intersection(
+                musique_question_key(record)
+                for record in grpo_sources
+            )
+        ),
         "eval_counts": eval_counts
     }
     write_json(summary_path, summary)
-    logger.info("Built SFT=%d, DPO=%d, GRPO=%d", len(sft_records), len(dpo_records), len(grpo_records))
+    logger.info(
+        "Built SFT=%d, cold-start=%d, DPO=%d, GRPO=%d",
+        len(sft_records),
+        len(cold_start_records),
+        len(dpo_records),
+        len(grpo_records)
+    )
 
 
 if __name__ == "__main__":

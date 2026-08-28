@@ -106,9 +106,6 @@ Question: {question}
 
 Reference evidence for teacher use only:
 {evidence}
-
-Reference answer for leakage checking only:
-{answer}
 """
 
 
@@ -132,4 +129,3 @@ def build_prompt(stage: str, payload: dict[str, Any]) -> str:
     if stage == "grpo":
         return GRPO_PROMPT_TEMPLATE.format(**payload)
     raise ValueError(f"Unsupported generation stage: {stage}")
-

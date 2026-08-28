@@ -19,6 +19,15 @@
       "system": "system"
     }
   },
+  "policy_query_multihop_sft_cold_start": {
+    "file_name": "train/sft_multihop_cold_start.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "system": "system"
+    }
+  },
   "policy_query_grpo_reference": {
     "file_name": "train/grpo_train.jsonl",
     "columns": {

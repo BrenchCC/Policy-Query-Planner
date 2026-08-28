@@ -74,6 +74,10 @@ def validate_planner_plan(value: str | dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Planner schema validation failed: {error.message}") from error
 
     seen_ids = set()
+    expected_ids = [f"q{index}" for index in range(1, len(plan["queries"]) + 1)]
+    actual_ids = [query_item["id"] for query_item in plan["queries"]]
+    if actual_ids != expected_ids:
+        raise ValueError(f"Planner query IDs must be sequential: {expected_ids}")
     for query_item in plan["queries"]:
         query_id = query_item["id"]
         if query_id in seen_ids:
@@ -106,6 +110,48 @@ def validate_sft_record(record: dict[str, Any]) -> None:
         if not isinstance(record.get(field), str) or not record[field].strip():
             raise ValueError(f"SFT field {field} must be a non-empty string")
     validate_planner_plan(record["output"])
+
+
+def validate_multihop_sft_record(record: dict[str, Any]) -> None:
+    """Validate one supervised multi-hop cold-start record.
+
+    Args:
+        record: Multi-hop SFT cold-start record to validate.
+
+    Raises:
+        ValueError: If provenance, metadata, or plan length is invalid.
+    """
+    allowed_fields = {
+        "id",
+        "input",
+        "output",
+        "system",
+        "hop_count",
+        "instruction",
+        "source_id",
+        "namespace",
+        "sample_type",
+        "source_dataset"
+    }
+    if set(record) != allowed_fields:
+        raise ValueError("Multi-hop SFT fields must match the cold-start contract")
+    validate_sft_record(record)
+    if not record["id"].startswith("sft_musique_cold_start_"):
+        raise ValueError("Multi-hop SFT ID must use the cold-start prefix")
+    if not isinstance(record.get("source_id"), str) or not record["source_id"].strip():
+        raise ValueError("Multi-hop SFT source_id must be non-empty")
+    if record.get("source_dataset") != "musique":
+        raise ValueError("Multi-hop SFT source_dataset must be musique")
+    if record.get("sample_type") != "musique_multihop_cold_start":
+        raise ValueError("Multi-hop SFT sample_type is invalid")
+    if record.get("namespace") != "musique_aux":
+        raise ValueError("Multi-hop SFT namespace must be musique_aux")
+    hop_count = record.get("hop_count")
+    if hop_count not in {2, 3, 4}:
+        raise ValueError("Multi-hop SFT hop_count must be 2, 3, or 4")
+    plan = validate_planner_plan(record["output"])
+    if len(plan["queries"]) != hop_count:
+        raise ValueError("Multi-hop SFT query count must match hop_count")
 
 
 def validate_dpo_record(record: dict[str, Any]) -> None:
@@ -147,6 +193,9 @@ def validate_grpo_record(record: dict[str, Any]) -> None:
     hop_count = record.get("hop_count")
     if hop_count not in {2, 3, 4}:
         raise ValueError("GRPO hop_count must be 2, 3, or 4")
+    plan = validate_planner_plan(record["output"])
+    if len(plan["queries"]) != hop_count:
+        raise ValueError("GRPO query count must match hop_count")
     if not isinstance(record.get("reference_answer"), str) or not record["reference_answer"].strip():
         raise ValueError("GRPO reference_answer must be non-empty")
     if record.get("namespace") not in {"musique_aux", "policy"}:

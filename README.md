@@ -1,6 +1,6 @@
 # Policy Query Planner Data Pipeline
 
-本项目构建英国公共政策 Query Planner 所需的知识库、官方评测集、SFT、DPO、GRPO 数据，以及可选的火山方舟生成接口。当前阶段不执行模型训练，也不实现 reward。
+本项目构建英国公共政策 Query Planner 所需的知识库、官方评测集、单跳 SFT、多跳 SFT 冷启动、DPO、GRPO-ready 数据，以及可选的火山方舟生成接口。当前阶段不执行模型训练，也不实现 reward。
 
 ## Environment
 
@@ -23,8 +23,8 @@ export LLM_ENDPOINT="your-endpoint"
 ```bash
 python data_preprocess/download_data.py
 python data_preprocess/clean_data.py
-python data_preprocess/build_datasets.py
-python data_preprocess/analyze_data.py
+python data_preprocess/build_datasets.py --force
+python data_preprocess/analyze_data.py --force
 python data_preprocess/prepare_generation.py --stage all
 python data_preprocess/validate_datasets.py --stage all
 pytest -q data_preprocess/tests
@@ -61,13 +61,33 @@ API 输出只用于替换本地基线样本。原始响应、解析结果、toke
 - `data/processed/eval/conditionalqa_test_blind.jsonl`：官方无答案测试集。
 - `data/processed/eval/qrecc_test.jsonl`：官方 Query Rewrite 测试集。
 - `data/processed/eval/musique_dev.jsonl`：官方多跳开发集。
-- `data/processed/train/sft_train.jsonl`：20,000条 Alpaca SFT 数据。
+- `data/processed/train/sft_train.jsonl`：20,000 条单跳 Alpaca SFT 基础数据。
+- `data/processed/train/sft_multihop_cold_start.jsonl`：2,000 条 MuSiQue 多跳 SFT 冷启动数据，其中 2/3/4-hop 分别为 1,000/600/400 条。
 - `data/processed/train/dpo_train.jsonl`：5,000条 LLaMA-Factory preference 数据。
-- `data/processed/train/grpo_train.jsonl`：5,000条多跳基线数据。
+- `data/processed/train/grpo_train.jsonl`：从冷启动集之外的 MuSiQue 样本中抽取的 5,000 条多跳 GRPO-ready 数据。
 - `data/processed/train/grpo_train_domain_augmented.jsonl`：API 完成后的领域增强版本。
 - `data/processed/dataset_info.json`：LLaMA-Factory 数据注册文件。
+
+MuSiQue 冷启动集与 GRPO-ready 集同时进行来源 ID 和规范化问题指纹隔离，二者零重叠，避免监督阶段提前看到强化学习样本。
+
+## Training and Evaluation Plan
+
+计划训练路径为：
+
+```text
+基础模型
+  ↓
+20K 单跳基础 SFT
+  ↓
+2K MuSiQue 多跳 SFT 冷启动
+  ↓
+共享冷启动检查点
+  ├─ DPO：优化单跳查询偏好与约束保真
+  └─ GRPO：优化多跳规划与检索收益
+```
+
+统一评测基础 SFT、冷启动、DPO 和 GRPO 四个检查点，用于分别衡量多跳冷启动的独立贡献，以及两种后训练方法相对同一共享检查点的增益。所有指标在训练与正式评测完成前均标记为待测。
 
 ## Reproducibility
 
 所有抽样使用固定随机种子。官方开发集和测试集不会参与训练数据或 API 请求构造。清洗、抽样、Schema 校验和 benchmark 泄漏检查都由测试覆盖。
-

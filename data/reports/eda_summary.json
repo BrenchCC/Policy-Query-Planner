@@ -156,6 +156,12 @@
       "policy_domain": 2338,
       "qrecc_no_op": 3532
     },
+    "cold_start_count": 2000,
+    "cold_start_hop_mix": {
+      "2": 1000,
+      "4": 400,
+      "3": 600
+    },
     "dpo_count": 5000,
     "dpo_mix": {
       "qrecc": 4000,
@@ -170,9 +176,9 @@
     },
     "grpo_count": 5000,
     "grpo_hop_mix": {
-      "2": 3134,
-      "4": 628,
-      "3": 1238
+      "2": 3242,
+      "3": 1200,
+      "4": 558
     }
   }
 }

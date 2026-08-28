@@ -41,7 +41,14 @@ EXPECTED_CONDITIONALQA_COUNTS = {
     "test_no_answer": 804
 }
 EXPECTED_QRECC_COUNTS = {"train": 63501, "test": 16451}
-TARGET_COUNTS = {"sft": 20000, "dpo": 5000, "grpo": 5000}
+TARGET_COUNTS = {
+    "sft": 20000,
+    "sft_multihop_cold_start": 2000,
+    "dpo": 5000,
+    "grpo": 5000
+}
+MULTIHOP_COLD_START_HOP_QUOTAS = {2: 1000, 3: 600, 4: 400}
+GRPO_HOP_MINIMUM = 500
 
 RANDOM_SEED = 42
 MAX_QUERY_COUNT = 4

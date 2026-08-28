@@ -38,18 +38,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_completed_ids(path: Path) -> set[str]:
-    """Load request IDs already present in a response file.
+def load_completed_requests(path: Path) -> dict[str, str]:
+    """Load request IDs and hashes already present in a response file.
 
     Args:
         path: Response JSONL path.
 
     Returns:
-        Completed request IDs.
+        Request ID to request hash mapping.
     """
     if not path.exists():
-        return set()
-    return {record["id"] for record in read_jsonl(path)}
+        return {}
+    return {
+        record["id"]: record.get("request_hash", "")
+        for record in read_jsonl(path)
+    }
+
+
+def reference_answer_fragments(value: str) -> list[str]:
+    """Split reference answers into normalized leakage-check fragments.
+
+    Args:
+        value: Semicolon-separated reference answers.
+
+    Returns:
+        Non-trivial normalized answer fragments.
+    """
+    return [
+        fragment
+        for fragment in (
+            normalized_key(part)
+            for part in value.split(";")
+        )
+        if len(fragment) > 4 and fragment != "notanswerable"
+    ]
 
 
 def validate_generated_plan(
@@ -76,8 +98,15 @@ def validate_generated_plan(
     if request["stage"] == "dpo" and serialized == request["payload"]["chosen"]:
         raise ValueError("Generated rejected plan equals the chosen plan")
     if request["stage"] == "grpo":
-        answer = request.get("reference_answer", "")
-        if len(normalized_key(answer)) > 4 and normalized_key(answer) in normalized_key(serialized):
+        if len(plan["queries"]) < 2:
+            raise ValueError("Generated GRPO plan must contain two to four queries")
+        serialized_key = normalized_key(serialized)
+        leaked_answers = [
+            answer
+            for answer in reference_answer_fragments(request.get("reference_answer", ""))
+            if answer in serialized_key
+        ]
+        if leaked_answers:
             raise ValueError("Generated plan leaks the reference answer")
     return serialized
 
@@ -105,6 +134,7 @@ def build_response_record(
         "id": request["id"],
         "stage": request["stage"],
         "source_id": request["source_id"],
+        "request_hash": request["request_hash"],
         "status": "success",
         "parsed_output": "",
         "raw_response": response_text,
@@ -154,8 +184,19 @@ def main() -> None:
     response_path = RESPONSE_ROOT / f"{args.stage}_responses.jsonl"
     if response_path.exists() and not args.resume:
         raise FileExistsError("Response file exists; use --resume to continue safely")
-    completed_ids = load_completed_ids(response_path) if args.resume else set()
-    pending = [request for request in requests if request["id"] not in completed_ids]
+    completed_requests = load_completed_requests(response_path) if args.resume else {}
+    stale_ids = [
+        request["id"]
+        for request in requests
+        if request["id"] in completed_requests
+        and completed_requests[request["id"]] != request.get("request_hash", "")
+    ]
+    if stale_ids:
+        raise ValueError(
+            "Response file contains stale requests; archive it before retrying: "
+            + ", ".join(stale_ids[:5])
+        )
+    pending = [request for request in requests if request["id"] not in completed_requests]
     if args.limit is not None:
         pending = pending[:args.limit]
     response_path.parent.mkdir(parents = True, exist_ok = True)
@@ -186,4 +227,3 @@ if __name__ == "__main__":
         handlers = [logging.StreamHandler()]
     )
     main()
-

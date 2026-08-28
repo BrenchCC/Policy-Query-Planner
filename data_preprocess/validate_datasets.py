@@ -8,21 +8,30 @@ from typing import Any, Callable
 # Add project root to Python path
 sys.path.append(os.getcwd())
 
-from data_preprocess.common import read_json, read_jsonl, sha256_file, normalized_key
+from data_preprocess.common import (
+    read_json,
+    read_jsonl,
+    sha256_file,
+    normalized_key,
+    stable_record_hash
+)
 from data_preprocess.config import (
     RAW_ROOT,
     INTERIM_ROOT,
     PROCESSED_ROOT,
     REQUEST_ROOT,
     TARGET_COUNTS,
+    GRPO_HOP_MINIMUM,
     EXPECTED_QRECC_COUNTS,
     QRECC_ARCHIVE_SHA256,
+    MULTIHOP_COLD_START_HOP_QUOTAS,
     EXPECTED_CONDITIONALQA_COUNTS,
     EVIDENCE_MAPPING_THRESHOLD
 )
 from data_preprocess.schemas import (
     validate_sft_record,
     validate_dpo_record,
+    validate_multihop_sft_record,
     validate_grpo_record,
     validate_knowledge_record
 )
@@ -146,6 +155,11 @@ def validate_train() -> None:
         TARGET_COUNTS["sft"],
         validate_sft_record
     )
+    cold_start_records = validate_records(
+        PROCESSED_ROOT / "train" / "sft_multihop_cold_start.jsonl",
+        TARGET_COUNTS["sft_multihop_cold_start"],
+        validate_multihop_sft_record
+    )
     dpo_records = validate_records(
         PROCESSED_ROOT / "train" / "dpo_train.jsonl",
         TARGET_COUNTS["dpo"],
@@ -168,7 +182,7 @@ def validate_train() -> None:
             record["id"]
             for record in read_jsonl(PROCESSED_ROOT / "eval" / file_name)
         )
-    for record in sft_records + dpo_records + grpo_records:
+    for record in sft_records + cold_start_records + dpo_records + grpo_records:
         if record["source_id"] in held_out_ids:
             raise ValueError(f"Benchmark leakage detected: {record['id']}")
 
@@ -196,13 +210,89 @@ def validate_train() -> None:
         if content_key in qrecc_test_keys:
             raise ValueError(f"QReCC content leakage detected: {record['id']}")
 
+    musique_train = {
+        record["id"]: record
+        for record in read_jsonl(INTERIM_ROOT / "musique_train.jsonl")
+    }
+    musique_dev_question_keys = {
+        normalized_key(record["question"])
+        for record in read_jsonl(INTERIM_ROOT / "musique_dev.jsonl")
+    }
+    for record in cold_start_records + grpo_records:
+        if record["source_id"] not in musique_train:
+            raise ValueError(f"MuSiQue source is not in train: {record['id']}")
+        question_key = normalized_key(musique_train[record["source_id"]]["question"])
+        if question_key in musique_dev_question_keys:
+            raise ValueError(f"MuSiQue content leakage detected: {record['id']}")
+
+    cold_source_ids = {record["source_id"] for record in cold_start_records}
+    grpo_source_ids = {record["source_id"] for record in grpo_records}
+    if cold_source_ids.intersection(grpo_source_ids):
+        raise ValueError("Multi-hop cold-start and GRPO source IDs overlap")
+    cold_question_keys = {
+        normalized_key(musique_train[source_id]["question"])
+        for source_id in cold_source_ids
+    }
+    grpo_question_keys = {
+        normalized_key(musique_train[source_id]["question"])
+        for source_id in grpo_source_ids
+    }
+    if cold_question_keys.intersection(grpo_question_keys):
+        raise ValueError("Multi-hop cold-start and GRPO question fingerprints overlap")
+
+    cold_hop_counts = {}
+    for record in cold_start_records:
+        hop_count = record["hop_count"]
+        cold_hop_counts[hop_count] = cold_hop_counts.get(hop_count, 0) + 1
+    if cold_hop_counts != MULTIHOP_COLD_START_HOP_QUOTAS:
+        raise ValueError(f"Unexpected cold-start hop distribution: {cold_hop_counts}")
+    grpo_hop_counts = {}
+    for record in grpo_records:
+        hop_count = record["hop_count"]
+        grpo_hop_counts[hop_count] = grpo_hop_counts.get(hop_count, 0) + 1
+    below_minimum = any(
+        grpo_hop_counts.get(hop_count, 0) < GRPO_HOP_MINIMUM
+        for hop_count in [2, 3, 4]
+    )
+    if below_minimum:
+        raise ValueError(f"GRPO hop minimum is not satisfied: {grpo_hop_counts}")
+
     error_counts = {}
     for record in dpo_records:
         error_counts[record["error_type"]] = error_counts.get(record["error_type"], 0) + 1
     if set(error_counts.values()) != {1000}:
         raise ValueError(f"DPO error categories are not balanced: {error_counts}")
-    if not (PROCESSED_ROOT / "dataset_info.json").exists():
+    dataset_info_path = PROCESSED_ROOT / "dataset_info.json"
+    if not dataset_info_path.exists():
         raise FileNotFoundError("Missing LLaMA-Factory dataset_info.json")
+    dataset_info = read_json(dataset_info_path)
+    if "policy_query_multihop_sft_cold_start" not in dataset_info:
+        raise ValueError("Missing multi-hop cold-start dataset registration")
+
+    augmented_path = PROCESSED_ROOT / "train" / "grpo_train_domain_augmented.jsonl"
+    if augmented_path.exists():
+        augmented_records = validate_records(
+            augmented_path,
+            TARGET_COUNTS["grpo"],
+            validate_grpo_record
+        )
+        augmented_musique = [
+            record
+            for record in augmented_records
+            if record["namespace"] == "musique_aux"
+        ]
+        augmented_policy = [
+            record
+            for record in augmented_records
+            if record["namespace"] == "policy"
+        ]
+        if len(augmented_musique) != 4000 or len(augmented_policy) != 1000:
+            raise ValueError("Unexpected domain-augmented GRPO mixture")
+        augmented_source_ids = {record["source_id"] for record in augmented_musique}
+        if not augmented_source_ids.issubset(grpo_source_ids):
+            raise ValueError("Domain-augmented MuSiQue records are outside the GRPO pool")
+        if augmented_source_ids.intersection(cold_source_ids):
+            raise ValueError("Domain-augmented GRPO overlaps cold-start data")
     logger.info("Training data validation passed")
 
 
@@ -217,6 +307,8 @@ def validate_api() -> None:
         for record in records:
             if not record["prompt"].strip() or not record["system"].strip():
                 raise ValueError(f"Empty API prompt: {record['id']}")
+            if record.get("request_hash") != stable_record_hash(record):
+                raise ValueError(f"Invalid API request hash: {record['id']}")
     logger.info("Optional API request validation passed")
 
 

@@ -144,6 +144,7 @@ def plot_conditionalqa(
 
 def plot_training_mix(
     sft_records: list[dict[str, Any]],
+    cold_start_records: list[dict[str, Any]],
     dpo_records: list[dict[str, Any]],
     grpo_records: list[dict[str, Any]],
     figure_root: Path
@@ -152,6 +153,7 @@ def plot_training_mix(
 
     Args:
         sft_records: Final SFT records.
+        cold_start_records: Multi-hop SFT cold-start records.
         dpo_records: Final DPO records.
         grpo_records: Final GRPO records.
         figure_root: Figure output directory.
@@ -161,19 +163,47 @@ def plot_training_mix(
     """
     stage_frame = pd.DataFrame(
         {
-            "stage": ["SFT", "DPO", "GRPO"],
-            "records": [len(sft_records), len(dpo_records), len(grpo_records)]
+            "stage": ["Base SFT", "Cold-start SFT", "DPO", "GRPO"],
+            "records": [
+                len(sft_records),
+                len(cold_start_records),
+                len(dpo_records),
+                len(grpo_records)
+            ]
         }
     )
     sns.barplot(data = stage_frame, x = "stage", y = "records", hue = "stage", legend = False)
     plt.title("Final training dataset sizes")
     save_figure(figure_root / "training_stage_sizes.png")
 
-    hop_counts = Counter(str(record["hop_count"]) for record in grpo_records)
+    cold_start_hop_counts = Counter(
+        str(record["hop_count"])
+        for record in cold_start_records
+    )
+    cold_start_hop_frame = pd.DataFrame(
+        {
+            "hop_count": sorted(cold_start_hop_counts),
+            "records": [
+                cold_start_hop_counts[key]
+                for key in sorted(cold_start_hop_counts)
+            ]
+        }
+    )
+    sns.barplot(
+        data = cold_start_hop_frame,
+        x = "hop_count",
+        y = "records",
+        hue = "hop_count",
+        legend = False
+    )
+    plt.title("Multi-hop SFT cold-start distribution")
+    save_figure(figure_root / "cold_start_hop_distribution.png")
+
+    grpo_hop_counts = Counter(str(record["hop_count"]) for record in grpo_records)
     hop_frame = pd.DataFrame(
         {
-            "hop_count": sorted(hop_counts),
-            "records": [hop_counts[key] for key in sorted(hop_counts)]
+            "hop_count": sorted(grpo_hop_counts),
+            "records": [grpo_hop_counts[key] for key in sorted(grpo_hop_counts)]
         }
     )
     sns.barplot(data = hop_frame, x = "hop_count", y = "records", hue = "hop_count", legend = False)
@@ -182,11 +212,13 @@ def plot_training_mix(
     return {
         "sft_count": len(sft_records),
         "sft_mix": dict(Counter(record["sample_type"] for record in sft_records)),
+        "cold_start_count": len(cold_start_records),
+        "cold_start_hop_mix": dict(cold_start_hop_counts),
         "dpo_count": len(dpo_records),
         "dpo_mix": dict(Counter(record["source_dataset"] for record in dpo_records)),
         "dpo_error_mix": dict(Counter(record["error_type"] for record in dpo_records)),
         "grpo_count": len(grpo_records),
-        "grpo_hop_mix": dict(hop_counts)
+        "grpo_hop_mix": dict(grpo_hop_counts)
     }
 
 
@@ -211,6 +243,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 ## 训练数据
 
 - SFT：{final_mix['sft_count']} 条，构成为 `{json.dumps(final_mix['sft_mix'], ensure_ascii = False)}`。
+- 多跳 SFT 冷启动：{final_mix['cold_start_count']} 条，hop 分布为 `{json.dumps(final_mix['cold_start_hop_mix'], ensure_ascii = False)}`。
 - DPO：{final_mix['dpo_count']} 条，来源为 `{json.dumps(final_mix['dpo_mix'], ensure_ascii = False)}`。
 - DPO 五类负样本严格均衡：`{json.dumps(final_mix['dpo_error_mix'], ensure_ascii = False)}`。
 - GRPO：{final_mix['grpo_count']} 条，hop 分布为 `{json.dumps(final_mix['grpo_hop_mix'], ensure_ascii = False)}`。
@@ -221,6 +254,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - 政策原始语料包含21篇未被官方问题 split 引用的文档；它们保留在知识库中，用于模拟真实检索噪声。
 - 仅有1条 ConditionalQA heading-only evidence 未映射到正文 chunk，已记录在 `data/interim/gold_coverage_issues.json`。
 - QReCC no-op 样本被保留，用于抑制模型对本来已独立的问题进行过度改写。
+- 多跳 SFT 冷启动与 GRPO-ready 数据按来源 ID 和问题指纹严格隔离。
 - MuSiQue 使用单独 namespace，训练或评测时必须选择对应知识库。
 
 ## 图表
@@ -230,6 +264,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - `figures/qrecc_rewrite_delta.png`
 - `figures/conditionalqa_evidence_counts.png`
 - `figures/training_stage_sizes.png`
+- `figures/cold_start_hop_distribution.png`
 - `figures/grpo_hop_distribution.png`
 """
     path = REPORT_ROOT / "eda_report.md"
@@ -250,6 +285,9 @@ def main() -> None:
     qrecc_train = read_jsonl(INTERIM_ROOT / "qrecc_train.jsonl")
     conditional_train = read_jsonl(INTERIM_ROOT / "conditionalqa_train.jsonl")
     sft_records = read_jsonl(PROCESSED_ROOT / "train" / "sft_train.jsonl")
+    cold_start_records = read_jsonl(
+        PROCESSED_ROOT / "train" / "sft_multihop_cold_start.jsonl"
+    )
     dpo_records = read_jsonl(PROCESSED_ROOT / "train" / "dpo_train.jsonl")
     grpo_records = read_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl")
     summary = {
@@ -259,6 +297,7 @@ def main() -> None:
         "conditionalqa": plot_conditionalqa(conditional_train, figure_root),
         "final_training_mix": plot_training_mix(
             sft_records,
+            cold_start_records,
             dpo_records,
             grpo_records,
             figure_root

@@ -10,7 +10,15 @@ from typing import Any
 sys.path.append(os.getcwd())
 
 from data_preprocess.common import read_jsonl, write_json, write_jsonl
-from data_preprocess.config import INTERIM_ROOT, PROCESSED_ROOT, RESPONSE_ROOT, PLANNER_SYSTEM_PROMPT
+from data_preprocess.build_datasets import stratified_sample
+from data_preprocess.config import (
+    INTERIM_ROOT,
+    PROCESSED_ROOT,
+    REQUEST_ROOT,
+    RESPONSE_ROOT,
+    RANDOM_SEED,
+    PLANNER_SYSTEM_PROMPT
+)
 from data_preprocess.schemas import validate_sft_record, validate_dpo_record, validate_grpo_record
 
 logger = logging.getLogger(__name__)
@@ -41,7 +49,20 @@ def successful_responses(stage: str) -> list[dict[str, Any]]:
     path = RESPONSE_ROOT / f"{stage}_responses.jsonl"
     if not path.exists():
         return []
-    return [record for record in read_jsonl(path) if record["status"] == "success"]
+    request_path = REQUEST_ROOT / f"{stage}_requests.jsonl"
+    if not request_path.exists():
+        return []
+    request_hashes = {
+        record["id"]: record.get("request_hash", "")
+        for record in read_jsonl(request_path)
+    }
+    return [
+        record
+        for record in read_jsonl(path)
+        if record["status"] == "success"
+        and record.get("stage") == stage
+        and record.get("request_hash", "") == request_hashes.get(record["id"])
+    ]
 
 
 def finalize_sft() -> dict[str, int]:
@@ -112,17 +133,18 @@ def finalize_grpo() -> dict[str, int]:
         ValueError: If fewer than 1,000 valid policy plans are available.
     """
     responses = sorted(successful_responses("grpo"), key = lambda record: record["source_id"])
-    if len(responses) < 1000:
-        raise ValueError(f"GRPO finalization requires 1000 valid responses; found {len(responses)}")
-    selected_responses = responses[:1000]
     conditional_records = {
         record["id"]: record
         for record in read_jsonl(INTERIM_ROOT / "conditionalqa_train.jsonl")
     }
     policy_records = []
-    for response in selected_responses:
+    for response in responses:
+        if response["source_id"] not in conditional_records:
+            continue
         source = conditional_records[response["source_id"]]
         plan = json.loads(response["parsed_output"])
+        if len(plan["queries"]) not in {2, 3, 4}:
+            continue
         record = {
             "id": "grpo_policy_" + source["id"],
             "instruction": (
@@ -141,17 +163,33 @@ def finalize_grpo() -> dict[str, int]:
             "hop_answers": [],
             "gold_doc_ids": source["gold_doc_ids"]
         }
-        validate_grpo_record(record)
+        try:
+            validate_grpo_record(record)
+        except ValueError:
+            continue
         policy_records.append(record)
+        if len(policy_records) == 1000:
+            break
+    if len(policy_records) < 1000:
+        raise ValueError(
+            f"GRPO finalization requires 1000 valid multi-hop responses; found {len(policy_records)}"
+        )
 
     baseline = read_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl")
-    mixed_records = baseline[:4000] + policy_records
+    selected_baseline = stratified_sample(
+        baseline,
+        4000,
+        lambda record: record["hop_count"],
+        RANDOM_SEED + 20
+    )
+    mixed_records = selected_baseline + policy_records
     write_jsonl(
         PROCESSED_ROOT / "train" / "grpo_train_domain_augmented.jsonl",
         mixed_records
     )
     return {
         "available": len(responses),
+        "baseline_records": len(selected_baseline),
         "policy_records": len(policy_records),
         "total": len(mixed_records)
     }
@@ -186,4 +224,3 @@ if __name__ == "__main__":
         handlers = [logging.StreamHandler()]
     )
     main()
-

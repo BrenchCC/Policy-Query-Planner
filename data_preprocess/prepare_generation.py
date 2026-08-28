@@ -8,7 +8,13 @@ from typing import Any
 # Add project root to Python path
 sys.path.append(os.getcwd())
 
-from data_preprocess.common import read_jsonl, write_json, write_jsonl, normalize_text
+from data_preprocess.common import (
+    read_jsonl,
+    write_json,
+    write_jsonl,
+    normalize_text,
+    stable_record_hash
+)
 from data_preprocess.config import INTERIM_ROOT, PROCESSED_ROOT, REQUEST_ROOT, PLANNER_SYSTEM_PROMPT
 from data_preprocess.prompts import build_prompt
 
@@ -130,8 +136,7 @@ def prepare_grpo_requests() -> list[dict[str, Any]]:
             "title": record["title"],
             "scenario": record["scenario"],
             "question": record["question"],
-            "evidence": "\n".join(f"- {value}" for value in record["evidences"]),
-            "answer": answer
+            "evidence": "\n".join(f"- {value}" for value in record["evidences"])
         }
         requests.append(
             {
@@ -165,6 +170,8 @@ def prepare_stage(stage: str) -> int:
         "grpo": prepare_grpo_requests
     }
     records = builders[stage]()
+    for record in records:
+        record["request_hash"] = stable_record_hash(record)
     count = write_jsonl(REQUEST_ROOT / f"{stage}_requests.jsonl", records)
     logger.info("Prepared %d %s requests", count, stage)
     return count
@@ -191,4 +198,3 @@ if __name__ == "__main__":
         handlers = [logging.StreamHandler()]
     )
     main()
-

@@ -151,6 +151,29 @@ def stable_hash(*values: str, length: int = 16) -> str:
     return digest[:length]
 
 
+def stable_record_hash(record: dict[str, Any]) -> str:
+    """Create a stable hash for a generation request.
+
+    Args:
+        record: Request record whose content should be fingerprinted.
+
+    Returns:
+        Full SHA256 request fingerprint.
+    """
+    payload = {
+        key: value
+        for key, value in record.items()
+        if key != "request_hash"
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii = False,
+        sort_keys = True,
+        separators = (",", ":")
+    )
+    return stable_hash(serialized, length = 64)
+
+
 def sha256_file(path: Path) -> str:
     """Calculate the SHA256 checksum of a file.
 
@@ -218,4 +241,3 @@ def extract_json_object(value: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("Model response must be a JSON object")
     return result
-

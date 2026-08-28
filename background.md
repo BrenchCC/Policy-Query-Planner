@@ -18,22 +18,26 @@ QReCC 提供对话历史、上下文相关问题和人工改写后的独立问�
 
 ### MuSiQue
 
-MuSiQue 提供2跳、3跳和4跳问题、显式问题分解、逐跳答案及支持段落索引。它用于构建不依赖外部模型的 GRPO 基线数据，并使用独立的辅助知识库 namespace，避免与政策语料相互污染。
+MuSiQue 提供2跳、3跳和4跳问题、显式问题分解、逐跳答案及支持段落索引。项目先从中独立抽取 2,000 条多跳 SFT 冷启动数据，再从剩余样本中抽取 5,000 条 GRPO-ready 数据；两者使用独立的辅助知识库 namespace，并通过来源 ID 与规范化问题指纹保证零重叠。
 
 ## 数据构建目标
 
-- SFT：20,000条英文 Alpaca 数据，其中包含 QReCC 非平凡改写、no-op 样本和 ConditionalQA 领域样本。
+- 基础 SFT：保留 20,000 条英文单跳 Alpaca 数据，其中包含 QReCC 非平凡改写、no-op 样本和 ConditionalQA 领域样本。
+- 多跳 SFT 冷启动：额外构建 2,000 条 MuSiQue 数据，2/3/4-hop 配额分别为 1,000/600/400，用于先学习查询拆分、顺序依赖和结构化输出。
 - DPO：5,000组英文 preference 数据，负样本覆盖未消解指代、实体遗漏、条件遗漏、查询过宽和错误上下文。
-- GRPO：5,000条英文多跳数据，保留参考计划、最终答案、逐跳答案和 gold 文档，但不在本阶段定义 reward。
+- GRPO：从多跳冷启动集之外的 MuSiQue 样本中抽取 5,000 条英文多跳数据，保留参考计划、最终答案、逐跳答案和 gold 文档，但不在本阶段定义 reward。
 - 知识库：分别输出政策语料和 MuSiQue 辅助语料的 JSONL 文件。
+
+计划训练流程为“20K 单跳基础 SFT → 2K 多跳 SFT 冷启动 → 共享冷启动检查点 → DPO/GRPO 两条分支”。DPO 与 GRPO 从同一冷启动权重出发，避免将“模型是否见过多跳格式”混入后训练方法的对比结果。
 
 ## 评测设计
 
-主要评测直接采用 ConditionalQA 官方开发集，不从训练集随机切分替代 benchmark。QReCC 官方测试集用于评估改写能力，MuSiQue 官方开发集用于评估多跳拆分。后续训练阶段可报告 Gold-document Recall@K、Evidence Recall@K、MRR、Joint Recall 和最终答案 EM/F1。
+主要评测直接采用 ConditionalQA 官方开发集，不从训练集随机切分替代 benchmark。QReCC 官方测试集用于评估改写能力，MuSiQue 官方开发集用于评估多跳拆分。后续统一评测基础 SFT、冷启动、DPO 和 GRPO 四个检查点，可报告 Gold-document Recall@K、Evidence Recall@K、MRR、Joint Recall 和最终答案 EM/F1。
 
 项目结果在完成训练和正式评测前保持为空：
 
-- SFT 阶段 Gold-document Recall@5：`[待测]`。
+- 基础 SFT 阶段 Gold-document Recall@5：`[待测]`。
+- 多跳冷启动阶段 Joint Recall@5：`[待测]`。
 - DPO 阶段 Evidence Recall@5：`[待测]`。
 - GRPO 阶段多跳 Joint Recall@5：`[待测]`。
 - 最终答案 F1：`[待测]`。
@@ -41,4 +45,3 @@ MuSiQue 提供2跳、3跳和4跳问题、显式问题分解、逐跳答案及支
 ## 使用边界
 
 ConditionalQA 的答案未经法律专业人员核验。本项目仅用于自然语言处理和检索研究，不应作为实际法律、福利资格或政府办事建议。原始政策内容来自历史快照，也不能代表当前有效政策。
-
