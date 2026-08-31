@@ -1,10 +1,15 @@
 import json
+from pathlib import Path
 
 import pytest
 
 from data_preprocess import build_datasets
-from data_preprocess.common import stable_record_hash
-from data_preprocess.generate_with_ark import validate_generated_plan
+from data_preprocess.common import read_jsonl, write_jsonl, stable_record_hash
+from data_preprocess.generate_with_ark import (
+    sort_response_file,
+    validate_generated_plan,
+    validate_grpo_annotation
+)
 from data_preprocess.prompts import build_prompt
 from data_preprocess.clean_data import best_evidence_chunk, chunk_policy_document
 from data_preprocess.build_datasets import (
@@ -126,26 +131,93 @@ def test_generation_request_hash_changes_with_prompt() -> None:
     assert stable_record_hash(request) != first_hash
 
 
+def test_sort_response_file_uses_request_order(tmp_path: Path) -> None:
+    """Normalize concurrent response output to the request queue order.
+
+    Args:
+        tmp_path: Temporary directory provided by pytest.
+    """
+    path = tmp_path / "responses.jsonl"
+    requests = [{"id": "first"}, {"id": "second"}, {"id": "third"}]
+    write_jsonl(
+        path,
+        [
+            {"id": "third", "status": "success"},
+            {"id": "first", "status": "invalid"},
+            {"id": "second", "status": "success"},
+            {"id": "first", "status": "success"}
+        ]
+    )
+    sort_response_file(path, requests)
+    records = read_jsonl(path)
+    assert [record["id"] for record in records] == ["first", "second", "third"]
+    assert records[0]["status"] == "success"
+
+
 def test_grpo_answer_leakage_checks_each_reference_answer() -> None:
-    """Reject a plan that copies one answer from a multi-answer reference."""
+    """Reject a synthetic policy plan that copies its reference answer."""
     request = {
         "stage": "grpo",
-        "reference_answer": "first valid answer; second sensitive answer"
+        "source_question": "What support is available?",
+        "evidence_items": [
+            {"text": "The relevant office is the council.", "gold_doc_id": "doc1"},
+            {"text": "The council offers a disabled facilities grant.", "gold_doc_id": "doc2"}
+        ]
     }
     response = json.dumps(
         {
-            "queries": [
-                {"id": "q1", "query": "find the governing policy", "depends_on": []},
-                {
-                    "id": "q2",
-                    "query": "second sensitive answer eligibility",
-                    "depends_on": []
-                }
-            ]
+            "scenario": "A resident needs an accessibility adaptation.",
+            "question": "Which support can the responsible office provide?",
+            "plan": {
+                "queries": [
+                    {"id": "q1", "query": "responsible office council", "depends_on": []},
+                    {
+                        "id": "q2",
+                        "query": "disabled facilities grant from {{q1.answer}}",
+                        "depends_on": ["q1"]
+                    }
+                ]
+            },
+            "hop_answers": ["council", "disabled facilities grant"],
+            "hop_evidence_indices": [0, 1],
+            "reference_answer": "disabled facilities grant"
         }
     )
     with pytest.raises(ValueError, match = "leaks"):
         validate_generated_plan(request, response)
+
+
+def test_validate_grounded_grpo_annotation() -> None:
+    """Accept grounded synthetic policy multi-hop metadata."""
+    request = {
+        "stage": "grpo",
+        "source_question": "What support is available?",
+        "evidence_items": [
+            {"text": "The responsible public body is the local council.", "gold_doc_id": "doc1"},
+            {"text": "A disabled facilities grant can pay for adaptations.", "gold_doc_id": "doc2"}
+        ]
+    }
+    response = json.dumps(
+        {
+            "scenario": "A resident needs an accessibility adaptation.",
+            "question": "What funding is offered by the responsible public body?",
+            "plan": {
+                "queries": [
+                    {"id": "q1", "query": "responsible public body", "depends_on": []},
+                    {
+                        "id": "q2",
+                        "query": "funding offered by {{q1.answer}} for adaptations",
+                        "depends_on": ["q1"]
+                    }
+                ]
+            },
+            "hop_answers": ["local council", "disabled facilities grant"],
+            "hop_evidence_indices": [0, 1],
+            "reference_answer": "grant"
+        }
+    )
+    annotation = validate_grpo_annotation(request, response)
+    assert annotation["gold_doc_ids"] == ["doc1", "doc2"]
 
 
 def test_multihop_allocation_is_deterministic_and_disjoint(monkeypatch) -> None:

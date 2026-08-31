@@ -3,6 +3,7 @@ import sys
 import json
 import logging
 import argparse
+from collections import defaultdict
 from typing import Any
 
 # Add project root to Python path
@@ -12,11 +13,11 @@ from data_preprocess.common import (
     read_jsonl,
     write_json,
     write_jsonl,
-    normalize_text,
     stable_record_hash
 )
-from data_preprocess.config import INTERIM_ROOT, PROCESSED_ROOT, REQUEST_ROOT, PLANNER_SYSTEM_PROMPT
-from data_preprocess.prompts import build_prompt
+from data_preprocess.config import INTERIM_ROOT, PROCESSED_ROOT, REQUEST_ROOT
+from data_preprocess.prompts import build_prompt, PLANNER_SYSTEM_PROMPT
+from data_preprocess.clean_data import best_evidence_chunk
 
 logger = logging.getLogger(__name__)
 
@@ -37,24 +38,6 @@ def parse_args() -> argparse.Namespace:
         help = "Generation queue to prepare"
     )
     return parser.parse_args()
-
-
-def flatten_answers(answers: list[Any]) -> str:
-    """Flatten ConditionalQA answer structures for prompt metadata.
-
-    Args:
-        answers: Raw ConditionalQA answer list.
-
-    Returns:
-        Semicolon-separated reference answers.
-    """
-    values = []
-    for answer in answers:
-        if isinstance(answer, list) and answer:
-            value = normalize_text(answer[0])
-            if value and value not in values:
-                values.append(value)
-    return "; ".join(values) or "not answerable"
 
 
 def prepare_sft_requests() -> list[dict[str, Any]]:
@@ -121,39 +104,66 @@ def prepare_dpo_requests() -> list[dict[str, Any]]:
 
 
 def prepare_grpo_requests() -> list[dict[str, Any]]:
-    """Prepare multi-evidence ConditionalQA decomposition requests.
+    """Prepare grounded synthetic policy multi-hop generation requests.
 
     Returns:
         GRPO generation request records.
     """
-    records = [
-        record
-        for record in read_jsonl(INTERIM_ROOT / "conditionalqa_train.jsonl")
-        if len(record["evidences"]) >= 2 and not record["not_answerable"]
-    ]
+    policy_chunks_by_url: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for chunk in read_jsonl(PROCESSED_ROOT / "knowledge_base" / "policy.jsonl"):
+        policy_chunks_by_url[chunk["url"]].append(chunk)
+    records = read_jsonl(INTERIM_ROOT / "conditionalqa_train.jsonl")
     requests = []
     for record in records:
-        answer = flatten_answers(record["answers"])
-        payload = {
-            "title": record["title"],
-            "scenario": record["scenario"],
-            "question": record["question"],
-            "evidence": "\n".join(f"- {value}" for value in record["evidences"])
+        if record["not_answerable"] or len(record["evidences"]) < 2:
+            continue
+        evidence_items = []
+        for evidence in record["evidences"]:
+            doc_id, score = best_evidence_chunk(
+                evidence,
+                policy_chunks_by_url[record["url"]]
+            )
+            if doc_id is None:
+                continue
+            evidence_items.append(
+                {
+                    "text": evidence,
+                    "gold_doc_id": doc_id,
+                    "mapping_score": score
+                }
+            )
+        distinct_doc_ids = {
+            item["gold_doc_id"]
+            for item in evidence_items
         }
-        requests.append(
-            {
-                "id": "api_grpo_" + record["id"],
-                "stage": "grpo",
-                "source_dataset": "conditionalqa",
-                "source_id": record["id"],
-                "system": PLANNER_SYSTEM_PROMPT,
-                "prompt": build_prompt("grpo", payload),
-                "payload": payload,
-                "reference_answer": answer,
-                "gold_doc_ids": record["gold_doc_ids"],
-                "evidences": record["evidences"]
+        if len(evidence_items) < 2 or len(distinct_doc_ids) < 2:
+            continue
+        variant_count = 2 if len(distinct_doc_ids) >= 3 else 1
+        for variant_index in range(1, variant_count + 1):
+            payload = {
+                "title": record["title"],
+                "scenario": record["scenario"],
+                "question": record["question"],
+                "variant_index": variant_index,
+                "evidence": "\n".join(
+                    f"[{index}] {item['text']}"
+                    for index, item in enumerate(evidence_items)
+                )
             }
-        )
+            requests.append(
+                {
+                    "id": f"api_grpo_{record['id']}_v{variant_index}",
+                    "stage": "grpo",
+                    "source_dataset": "conditionalqa",
+                    "source_id": record["id"],
+                    "variant_index": variant_index,
+                    "system": PLANNER_SYSTEM_PROMPT,
+                    "prompt": build_prompt("grpo", payload),
+                    "payload": payload,
+                    "source_question": record["question"],
+                    "evidence_items": evidence_items
+                }
+            )
     return requests
 
 

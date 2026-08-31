@@ -4,6 +4,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+EMBEDDING_TEXT_TEMPLATE = "{title}\n\n{text}"
+PLANNER_SYSTEM_PROMPT = (
+    "You are a retrieval query planner. Return valid JSON only. Do not answer the user's question. "
+    "Preserve named entities, dates, quantities, relationships, and eligibility constraints."
+)
+
 OUTPUT_SCHEMA_TEXT = json.dumps(
     {
         "queries": [
@@ -90,31 +96,34 @@ Task type: {task_type}
 Expected chosen hop count: {hop_count}
 """
 
-GRPO_PROMPT_TEMPLATE = """You are preparing a reference multi-hop retrieval plan for a public-policy question.
+GRPO_PROMPT_TEMPLATE = """You are creating one grounded synthetic multi-hop example for a public-policy retrieval planner.
 
 Task:
-Decompose the scenario and question into two to four ordered retrieval queries. Each query must retrieve one necessary fact or rule. Later queries may depend on answers from earlier queries. A dependent query must use placeholders such as {{{{q1.answer}}}} and list the matching dependency in depends_on.
+Use the indexed policy evidence to write a new scenario and question that genuinely require two to four retrieval steps. Then provide the reference query plan and private reward metadata. Do not merely split the original question into several paraphrases.
 
 Hard rules:
 1. Return exactly one JSON object and no Markdown.
-2. Use sequential ids q1, q2, q3, q4 without gaps.
-3. Dependencies may only refer to earlier queries.
-4. Every dependency must appear as a placeholder in the query text.
-5. Do not answer the final question.
-6. Do not quote or reveal the reference answer.
-7. Preserve all eligibility-changing constraints from the scenario.
-8. Avoid redundant queries; each hop must retrieve distinct evidence.
-9. Make every query independently executable after placeholders are substituted.
+2. Create a new question, not a paraphrase of the source question.
+3. The plan must contain two to four non-redundant queries with sequential ids.
+4. At least one later query must depend on an earlier answer.
+5. Dependencies may only refer to earlier queries and must use placeholders such as {{{{q1.answer}}}}.
+6. The plan must not reveal the final reference answer.
+7. hop_answers must contain one short evidence-grounded answer for every query.
+8. hop_evidence_indices must contain one indexed evidence number for every query.
+9. Each hop answer must be directly supported by its selected evidence.
+10. Different hops must use different evidence indices and different policy chunks.
+11. reference_answer must be a short answer directly supported by the selected evidence.
+12. Variant {variant_index} should use a different reasoning chain when another variant is requested.
 
-Output shape example:
-{{"queries":[{{"id":"q1","query":"probate administrator priority for an intestate estate","depends_on":[]}},{{"id":"q2","query":"priority between {{{{q1.answer}}}} and a sibling of the deceased","depends_on":["q1"]}}]}}
+Output shape:
+{{"scenario":"...","question":"...","plan":{{"queries":[{{"id":"q1","query":"...","depends_on":[]}},{{"id":"q2","query":"... {{{{q1.answer}}}} ...","depends_on":["q1"]}}]}},"hop_answers":["...","..."],"hop_evidence_indices":[0,1],"reference_answer":"..."}}
 
-Input:
+Source material for inspiration:
 Policy title: {title}
-Scenario: {scenario}
-Question: {question}
+Original scenario: {scenario}
+Original question: {question}
 
-Reference evidence for teacher use only:
+Indexed policy evidence for teacher use only:
 {evidence}
 """
 

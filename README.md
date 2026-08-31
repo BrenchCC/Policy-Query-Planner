@@ -14,6 +14,10 @@ API 配置只通过环境变量读取，不要将密钥写入代码：
 export LLM_API_KEY="your-key"
 export LLM_API_BASE_URL="your-base-url"
 export LLM_ENDPOINT="your-endpoint"
+export EMBEDDING_API_KEY="your-embedding-key"
+export EMBEDDING_BASE_URL="https://your-workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+export EMBEDDING_MODEL="qwen3.7-text-embedding"
+export EMBEDDING_DIMENSIONS="1024"
 ```
 
 ## Local Pipeline
@@ -32,7 +36,24 @@ pytest -q data_preprocess/tests
 
 下载脚本固定上游提交并记录 SHA256。重复执行时，校验成功的文件会被跳过；只有显式指定 `--force` 才会重新下载。
 
-## Optional API Generation
+## Embedding Index Build
+
+入库使用 `title + "\n\n" + text` 生成 1024 维向量，并为 `policy` 和 `musique_aux` 分别构建 L2 归一化后的 FAISS `IndexFlatIP` 索引。建议先把少量烟测产物写到临时目录：
+
+```bash
+python embedding/build_embedding_store.py --namespace all --limit 4 --output-root /tmp/policy-query-planner-vector-smoke
+python embedding/build_embedding_store.py --namespace all --limit 8 --resume --output-root /tmp/policy-query-planner-vector-smoke
+```
+
+确认 API 和断点续跑正常后，再执行正式全量入库：
+
+```bash
+python embedding/build_embedding_store.py --namespace all
+```
+
+每个 namespace 生成 `vectors.pth`、`index.faiss`、`metadata.jsonl` 和 `manifest.json`。`vectors.pth` 是按源 JSONL 顺序排列的 `float32` PyTorch Tensor；manifest 记录源文件 SHA256、模型配置、已完成条数、索引条数和 Token 用量。已有产物必须显式使用 `--resume` 续跑或使用 `--force` 重建。
+
+## Model-Assisted Generation
 
 先使用 dry-run 检查请求，不产生 API 费用：
 
@@ -42,16 +63,25 @@ python data_preprocess/generate_with_ark.py --stage dpo --dry-run
 python data_preprocess/generate_with_ark.py --stage grpo --dry-run
 ```
 
-配置环境变量后，可由用户手动执行：
+SFT 和 DPO 的 API 增强是可选项；生成正式的领域混合 GRPO-ready 数据则需要执行 GRPO Teacher 调用。配置环境变量后，可由用户手动执行：
 
 ```bash
 bash scripts/run_api_generation.sh test
 bash scripts/run_api_generation.sh full
 ```
 
+如果只需要重新生成 GRPO 混合集，可以单独执行：
+
+```bash
+python data_preprocess/prepare_generation.py --stage grpo
+python data_preprocess/generate_with_ark.py --stage grpo --workers 8 --max-retries 2 --resume
+python data_preprocess/finalize_datasets.py --stage grpo
+python data_preprocess/validate_datasets.py --stage train
+```
+
 `test` 模式默认每阶段调用 2 条；`full` 模式依次完成 SFT、DPO、GRPO，并自动执行数据合并和全量校验。可以通过 `WORKERS`、`MAX_RETRIES`、`LOG_EVERY`、`TEST_LIMIT` 和 `TEST_WORKERS` 覆盖默认参数，例如 `WORKERS=8 bash scripts/run_api_generation.sh full`。
 
-生成脚本使用 `tqdm` 展示实时进度。完整日志分别追加写入 `logs/generate_with_ark_<stage>.log`；终端会过滤 `httpx/httpcore` 的逐请求 INFO，只显示阶段进度、成功/失败统计和 Token 用量。API 输出只用于替换本地基线样本，原始响应、解析结果、Token 用量和失败原因会分别保存，不会覆盖原始数据。
+生成脚本使用 `tqdm` 展示实时进度。并发任务完成后先按请求序号进入缓冲区，再按原始请求队列顺序写入响应 JSONL；阶段结束时还会对包含历史断点结果的文件做一次顺序规范化。完整日志分别追加写入 `logs/generate_with_ark_<stage>.log`；终端会过滤 `httpx/httpcore` 的逐请求 INFO，只显示阶段进度、成功/失败统计和 Token 用量。API 输出用于替换 SFT/DPO 基线标签，并为 GRPO 合成经过证据校验的政策领域多跳样本。原始响应、解析结果、Token 用量和失败原因会分别保存，不会覆盖本地基线数据。
 
 ## Main Outputs
 
@@ -64,11 +94,11 @@ bash scripts/run_api_generation.sh full
 - `data/processed/train/sft_train.jsonl`：20,000 条单跳 Alpaca SFT 基础数据。
 - `data/processed/train/sft_multihop_cold_start.jsonl`：2,000 条 MuSiQue 多跳 SFT 冷启动数据，其中 2/3/4-hop 分别为 1,000/600/400 条。
 - `data/processed/train/dpo_train.jsonl`：5,000 条 preference 数据；2,500 条单跳、2,500 条多跳，1/2/3/4-hop 分别为 2,500/1,250/1,000/250。
-- `data/processed/train/grpo_train.jsonl`：5,000 条 GRPO-ready 数据；1,000 条单跳、4,000 条多跳，1/2/3/4-hop 分别为 1,000/2,586/910/504。
-- `data/processed/train/grpo_train_domain_augmented.jsonl`：API 完成后的领域增强版本。
+- `data/processed/train/grpo_train.jsonl`：本地候选池；包含 1,000 条政策单跳与 4,000 条 MuSiQue 通用多跳，用于无 API 基线和后续混合抽样。
+- `data/processed/train/grpo_train_mixed.jsonl`：正式的 5,000 条混合 GRPO-ready 数据；由 3,000 条 MuSiQue 通用多跳、1,000 条模型合成且证据校验通过的 ConditionalQA 领域多跳、1,000 条 ConditionalQA 领域单跳组成，比例为 60%/20%/20%。
 - `data/processed/dataset_info.json`：LLaMA-Factory 数据注册文件。
 
-MuSiQue 多跳 SFT、DPO 与 GRPO-ready 三个集合同时进行来源 ID 和规范化问题指纹隔离，任意两组均零重叠。单跳 DPO 与单跳 GRPO 的 ConditionalQA 来源也保持零重叠。
+MuSiQue 多跳 SFT、DPO 与 GRPO 候选池进行来源 ID 和规范化问题指纹隔离，任意两组均零重叠。单跳 DPO 与领域单跳 GRPO 的 ConditionalQA 来源也保持零重叠。合成的领域多跳问题必须不同于原始问题，并通过计划依赖、逐跳答案、证据索引、Gold chunk 和答案泄漏校验。
 
 ## Training and Evaluation Plan
 
@@ -83,14 +113,16 @@ MuSiQue 多跳 SFT、DPO 与 GRPO-ready 三个集合同时进行来源 ID 和规
   ↓
 共享冷启动检查点
   ├─ DPO：用单跳/多跳偏好对强化约束保真、步骤完整性与依赖正确性
-  └─ GRPO：用 20% 单跳 + 80% 多跳优化检索收益并抑制过度拆分
+  └─ GRPO：60% 通用多跳 + 20% 领域多跳 + 20% 领域单跳
 ```
 
 统一评测基础 SFT、冷启动、DPO 和 GRPO 四个检查点，用于分别衡量多跳冷启动的独立贡献，以及两种后训练方法相对同一共享检查点的增益。所有指标在训练与正式评测完成前均标记为待测。
 
-GRPO 计划使用 `Qwen/Qwen3-4B-Instruct-2507`，执行候选计划后，以冻结回复模型对 Gold 答案 token 的长度归一化概率构造二值奖励；同时按 `task_type` 和参考 `hop_count` 对不必要拆分、冗余查询及超出预期跳数的计划进行门控。自研 Trainer、veRL、4 张 A100 的显存分配和超参数估算见 [GRPO 算法与训练配置设计](docs/grpo_algorithm_design.md)。
+GRPO 计划使用 `Qwen/Qwen3-4B-Instruct-2507`。总奖励包含 10% 的分层格式塑形和 90% 的端到端语义效果：格式部分检查 JSON、Schema、编号与依赖；每个可执行计划实际完成逐跳检索、子答案生成与最终答案生成。子答案正确率用于过程塑形，最终答案通过规则与独立 Judge 检查正确、完整、证据支持和矛盾，并作为语义一票否决；同时按 `task_type` 和参考 `hop_count` 对不必要拆分、冗余查询及超出预期跳数的计划进行硬门控。完整方案见 [GRPO 算法与训练配置设计](docs/grpo_algorithm_design.md)。
 
 DPO 与 GRPO 的 Planner Prompt 不直接透露样本是单跳还是多跳，而是统一要求生成“最小充分计划”：一跳足够时只输出一条 Query，确实需要多步证据时才建立依赖。`task_type` 和 `hop_count` 仅用于数据校验、分层采样和 reward 门控。
+
+领域多跳不是把原始 ConditionalQA 问题机械拆成多条 Query。Teacher 根据至少两个独立政策 Gold chunk 合成新场景和新问题，同时输出私有的 `hop_answers` 与证据索引；流水线要求每跳答案能在对应 evidence 中找到、每跳使用不同 Gold chunk、至少存在一条真实依赖，并阻止最终答案泄漏进 Planner 计划。Teacher 的私有标注只进入 reward 侧，Planner 训练输入仍然只有 `system + instruction + input`。
 
 ## Reproducibility
 

@@ -32,9 +32,9 @@ from data_preprocess.config import (
     GRPO_MULTIHOP_COUNT,
     DPO_SINGLE_SOURCE_QUOTAS,
     DPO_MULTIHOP_HOP_QUOTAS,
-    MULTIHOP_COLD_START_HOP_QUOTAS,
-    PLANNER_SYSTEM_PROMPT
+    MULTIHOP_COLD_START_HOP_QUOTAS
 )
+from data_preprocess.prompts import PLANNER_SYSTEM_PROMPT
 from data_preprocess.schemas import (
     serialize_plan,
     validate_sft_record,
@@ -826,7 +826,7 @@ def build_grpo_records(
     single_policy_records: list[dict[str, Any]],
     policy_plans: dict[str, str]
 ) -> list[dict[str, Any]]:
-    """Build a 1K single-hop plus 4K multi-hop GRPO-ready mixture.
+    """Build the 1K policy-single plus 4K general-multihop GRPO candidate pool.
 
     Args:
         selected_records: Disjoint MuSiQue records selected for GRPO.
@@ -943,8 +943,8 @@ def write_dataset_info() -> None:
                 "system": "system"
             }
         },
-        "policy_query_grpo_domain_augmented": {
-            "file_name": "train/grpo_train_domain_augmented.jsonl",
+        "policy_query_grpo_mixed": {
+            "file_name": "train/grpo_train_mixed.jsonl",
             "columns": {
                 "prompt": "instruction",
                 "query": "input",

@@ -225,15 +225,41 @@ def validate_grpo_record(record: dict[str, Any]) -> None:
         raise ValueError("GRPO hop_answers must be a list")
     if not isinstance(gold_doc_ids, list) or not gold_doc_ids:
         raise ValueError("GRPO gold_doc_ids must be a non-empty list")
+    if not all(isinstance(answer, str) and answer.strip() for answer in hop_answers):
+        raise ValueError("GRPO hop_answers must contain non-empty strings")
+    if not all(isinstance(doc_id, str) and doc_id.strip() for doc_id in gold_doc_ids):
+        raise ValueError("GRPO gold_doc_ids must contain non-empty strings")
     if record["namespace"] == "musique_aux":
+        if record.get("source_dataset") != "musique":
+            raise ValueError("MuSiQue GRPO namespace requires MuSiQue provenance")
         if hop_count == 1:
             raise ValueError("MuSiQue GRPO records must be multi-hop")
         if len(hop_answers) != hop_count:
             raise ValueError("MuSiQue GRPO hop_answers must match hop_count")
         if len(gold_doc_ids) != hop_count:
             raise ValueError("MuSiQue GRPO gold_doc_ids must match hop_count")
-    elif hop_count == 1 and len(gold_doc_ids) < 1:
-        raise ValueError("Single-hop policy GRPO records require gold documents")
+    elif record.get("source_dataset") != "conditionalqa":
+        raise ValueError("Policy GRPO namespace requires ConditionalQA provenance")
+    elif hop_count == 1:
+        if len(gold_doc_ids) < 1:
+            raise ValueError("Single-hop policy GRPO records require gold documents")
+    else:
+        if record.get("sample_type") != "conditionalqa_synthetic_multihop":
+            raise ValueError("Policy multi-hop GRPO sample_type is invalid")
+        if len(hop_answers) != hop_count:
+            raise ValueError("Policy multi-hop GRPO hop_answers must match hop_count")
+        evidence_indices = record.get("hop_evidence_indices")
+        if (
+            not isinstance(evidence_indices, list)
+            or len(evidence_indices) != hop_count
+            or not all(isinstance(index, int) for index in evidence_indices)
+            or len(set(evidence_indices)) != hop_count
+        ):
+            raise ValueError("Policy multi-hop GRPO evidence indices must match unique hops")
+        if len(gold_doc_ids) != hop_count or len(set(gold_doc_ids)) != hop_count:
+            raise ValueError("Policy multi-hop GRPO requires one distinct Gold document per hop")
+        if not any(query["depends_on"] for query in plan["queries"]):
+            raise ValueError("Policy multi-hop GRPO requires at least one dependency")
 
 
 def validate_knowledge_record(record: dict[str, Any]) -> None:

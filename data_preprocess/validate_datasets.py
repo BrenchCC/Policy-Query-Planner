@@ -24,6 +24,9 @@ from data_preprocess.config import (
     TARGET_COUNTS,
     GRPO_HOP_MINIMUM,
     GRPO_SINGLE_COUNT,
+    GRPO_POLICY_SINGLE_COUNT,
+    GRPO_POLICY_MULTIHOP_COUNT,
+    GRPO_GENERAL_MULTIHOP_COUNT,
     DPO_SINGLE_SOURCE_QUOTAS,
     DPO_MULTIHOP_HOP_QUOTAS,
     EXPECTED_QRECC_COUNTS,
@@ -331,7 +334,7 @@ def validate_train() -> None:
     if "policy_query_multihop_sft_cold_start" not in dataset_info:
         raise ValueError("Missing multi-hop cold-start dataset registration")
 
-    augmented_path = PROCESSED_ROOT / "train" / "grpo_train_domain_augmented.jsonl"
+    augmented_path = PROCESSED_ROOT / "train" / "grpo_train_mixed.jsonl"
     if augmented_path.exists():
         augmented_records = validate_records(
             augmented_path,
@@ -348,8 +351,29 @@ def validate_train() -> None:
             for record in augmented_records
             if record["namespace"] == "policy"
         ]
-        if len(augmented_musique) != 3000 or len(augmented_policy) != 2000:
-            raise ValueError("Unexpected domain-augmented GRPO mixture")
+        augmented_policy_single = [
+            record
+            for record in augmented_policy
+            if record["task_type"] == "single_hop"
+        ]
+        augmented_policy_multihop = [
+            record
+            for record in augmented_policy
+            if record["task_type"] == "multi_hop"
+        ]
+        expected_mixture = (
+            len(augmented_musique) == GRPO_GENERAL_MULTIHOP_COUNT
+            and len(augmented_policy_multihop) == GRPO_POLICY_MULTIHOP_COUNT
+            and len(augmented_policy_single) == GRPO_POLICY_SINGLE_COUNT
+        )
+        if not expected_mixture:
+            raise ValueError("Unexpected GRPO training mixture")
+        generated_question_keys = {
+            normalized_key(record["input"])
+            for record in augmented_policy_multihop
+        }
+        if len(generated_question_keys) != len(augmented_policy_multihop):
+            raise ValueError("Generated policy multi-hop GRPO questions are duplicated")
         augmented_source_ids = {record["source_id"] for record in augmented_musique}
         if not augmented_source_ids.issubset(grpo_source_ids):
             raise ValueError("Domain-augmented MuSiQue records are outside the GRPO pool")
@@ -360,11 +384,13 @@ def validate_train() -> None:
 
 def validate_api() -> None:
     """Validate optional generation request queues."""
-    expected_counts = {"sft": 2338, "dpo": 3000, "grpo": 1811}
-    for stage, expected_count in expected_counts.items():
+    expected_counts = {"sft": 2338, "dpo": 3000}
+    for stage in ["sft", "dpo", "grpo"]:
         records = read_jsonl(REQUEST_ROOT / f"{stage}_requests.jsonl")
-        if len(records) != expected_count:
+        if stage in expected_counts and len(records) != expected_counts[stage]:
             raise ValueError(f"Unexpected {stage} request count: {len(records)}")
+        if stage == "grpo" and len(records) < GRPO_POLICY_MULTIHOP_COUNT:
+            raise ValueError(f"Insufficient GRPO generation requests: {len(records)}")
         assert_unique_ids(records, f"{stage} requests")
         for record in records:
             if not record["prompt"].strip() or not record["system"].strip():

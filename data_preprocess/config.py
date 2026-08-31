@@ -53,16 +53,14 @@ DPO_MULTIHOP_HOP_QUOTAS = {2: 1250, 3: 1000, 4: 250}
 GRPO_SINGLE_COUNT = 1000
 GRPO_MULTIHOP_COUNT = 4000
 GRPO_HOP_MINIMUM = 500
+GRPO_GENERAL_MULTIHOP_COUNT = 3000
+GRPO_POLICY_MULTIHOP_COUNT = 1000
+GRPO_POLICY_SINGLE_COUNT = 1000
 
 RANDOM_SEED = 42
 MAX_QUERY_COUNT = 4
 MAX_POLICY_CHUNK_CHARS = 1600
 MIN_POLICY_CHUNK_CHARS = 120
 EVIDENCE_MAPPING_THRESHOLD = 0.99
-
-PLANNER_SYSTEM_PROMPT = (
-    "You are a retrieval query planner. Return valid JSON only. Do not answer the user's question. "
-    "Preserve named entities, dates, quantities, relationships, and eligibility constraints."
-)
 
 LLM_ENDPOINT = os.environ.get("LLM_ENDPOINT", "")

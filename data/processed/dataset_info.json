@@ -37,8 +37,8 @@
       "system": "system"
     }
   },
-  "policy_query_grpo_domain_augmented": {
-    "file_name": "train/grpo_train_domain_augmented.jsonl",
+  "policy_query_grpo_mixed": {
+    "file_name": "train/grpo_train_mixed.jsonl",
     "columns": {
       "prompt": "instruction",
       "query": "input",

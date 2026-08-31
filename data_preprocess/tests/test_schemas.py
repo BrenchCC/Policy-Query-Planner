@@ -131,3 +131,35 @@ def test_reject_grpo_hop_count_mismatch() -> None:
     }
     with pytest.raises(ValueError, match = "query count"):
         validate_grpo_record(record)
+
+
+def test_validate_policy_multihop_grpo_record() -> None:
+    """Accept a grounded synthetic policy multi-hop GRPO record."""
+    record = {
+        "id": "grpo_policy_multihop_example",
+        "instruction": "Create the minimum sufficient plan.",
+        "input": "Scenario:\nNeeds adaptation.\n\nQuestion:\nWhat funding applies?",
+        "output": serialize_plan(
+            [
+                {"id": "q1", "query": "responsible public body", "depends_on": []},
+                {
+                    "id": "q2",
+                    "query": "funding from {{q1.answer}} for adaptations",
+                    "depends_on": ["q1"]
+                }
+            ]
+        ),
+        "system": "Return valid JSON only.",
+        "source_dataset": "conditionalqa",
+        "source_id": "train-1",
+        "sample_type": "conditionalqa_synthetic_multihop",
+        "namespace": "policy",
+        "hop_count": 2,
+        "task_type": "multi_hop",
+        "reference_answer": "grant",
+        "answer_aliases": [],
+        "hop_answers": ["local council", "grant"],
+        "hop_evidence_indices": [0, 1],
+        "gold_doc_ids": ["policy_doc1", "policy_doc2"]
+    }
+    validate_grpo_record(record)

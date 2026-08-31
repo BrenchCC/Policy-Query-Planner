@@ -204,6 +204,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Generated embedding tensors and FAISS indexes
+data/processed/vector_store/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

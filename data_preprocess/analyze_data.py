@@ -238,6 +238,12 @@ def plot_training_mix(
         "dpo_error_mix": dict(Counter(record["error_type"] for record in dpo_records)),
         "grpo_count": len(grpo_records),
         "grpo_task_mix": dict(Counter(record["task_type"] for record in grpo_records)),
+        "grpo_source_task_mix": dict(
+            Counter(
+                f"{record['source_dataset']}:{record['task_type']}"
+                for record in grpo_records
+            )
+        ),
         "grpo_hop_mix": dict(grpo_hop_counts)
     }
 
@@ -267,7 +273,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - DPO：{final_mix['dpo_count']} 条，来源为 `{json.dumps(final_mix['dpo_mix'], ensure_ascii = False)}`。
 - DPO 单跳/多跳构成为 `{json.dumps(final_mix['dpo_task_mix'], ensure_ascii = False)}`，hop 分布为 `{json.dumps(final_mix['dpo_hop_mix'], ensure_ascii = False)}`。
 - DPO 十类单因素困难负样本严格均衡：`{json.dumps(final_mix['dpo_error_mix'], ensure_ascii = False)}`。
-- GRPO：{final_mix['grpo_count']} 条，单跳/多跳构成为 `{json.dumps(final_mix['grpo_task_mix'], ensure_ascii = False)}`，hop 分布为 `{json.dumps(final_mix['grpo_hop_mix'], ensure_ascii = False)}`。
+- GRPO：{final_mix['grpo_count']} 条，来源与任务构成为 `{json.dumps(final_mix['grpo_source_task_mix'], ensure_ascii = False)}`，hop 分布为 `{json.dumps(final_mix['grpo_hop_mix'], ensure_ascii = False)}`。
 
 ## 质量观察
 
@@ -275,7 +281,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - 政策原始语料包含21篇未被官方问题 split 引用的文档；它们保留在知识库中，用于模拟真实检索噪声。
 - 仅有1条 ConditionalQA heading-only evidence 未映射到正文 chunk，已记录在 `data/interim/gold_coverage_issues.json`。
 - QReCC no-op 样本被保留，用于抑制模型对本来已独立的问题进行过度改写。
-- 多跳 SFT、DPO 与 GRPO-ready 数据按来源 ID 和问题指纹严格隔离。
+- MuSiQue 多跳 SFT、DPO 与 GRPO 候选池按来源 ID 和问题指纹严格隔离；领域多跳另做逐跳证据与生成问题校验。
 - DPO 与 GRPO 都保留单跳样本，用于抑制不必要拆分和奖励投机。
 - MuSiQue 使用单独 namespace，训练或评测时必须选择对应知识库。
 
@@ -312,7 +318,13 @@ def main() -> None:
         PROCESSED_ROOT / "train" / "sft_multihop_cold_start.jsonl"
     )
     dpo_records = read_jsonl(PROCESSED_ROOT / "train" / "dpo_train.jsonl")
-    grpo_records = read_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl")
+    mixed_grpo_path = PROCESSED_ROOT / "train" / "grpo_train_mixed.jsonl"
+    grpo_path = (
+        mixed_grpo_path
+        if mixed_grpo_path.exists()
+        else PROCESSED_ROOT / "train" / "grpo_train.jsonl"
+    )
+    grpo_records = read_jsonl(grpo_path)
     summary = {
         "cleaning": read_json(INTERIM_ROOT / "cleaning_summary.json"),
         "policy_chunk_lengths": plot_policy_lengths(policy_records, figure_root),

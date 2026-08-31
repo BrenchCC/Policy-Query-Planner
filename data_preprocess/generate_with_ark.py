@@ -157,6 +157,96 @@ def reference_answer_fragments(value: str) -> list[str]:
     ]
 
 
+def validate_grpo_annotation(
+    request: dict[str, Any],
+    response_text: str
+) -> dict[str, Any]:
+    """Validate one synthetic policy multi-hop annotation.
+
+    Args:
+        request: GRPO generation request with indexed evidence.
+        response_text: Raw model response text.
+
+    Returns:
+        Validated annotation with a parsed planner plan.
+
+    Raises:
+        ValueError: If structure, grounding, dependencies, or leakage checks fail.
+    """
+    annotation = extract_json_object(response_text)
+    required_fields = {
+        "scenario",
+        "question",
+        "plan",
+        "hop_answers",
+        "hop_evidence_indices",
+        "reference_answer"
+    }
+    if set(annotation) != required_fields:
+        raise ValueError("Generated GRPO annotation fields do not match the contract")
+    for field in ["scenario", "question", "reference_answer"]:
+        if not isinstance(annotation[field], str) or not annotation[field].strip():
+            raise ValueError(f"Generated GRPO {field} must be non-empty")
+    if normalized_key(annotation["question"]) == normalized_key(request["source_question"]):
+        raise ValueError("Generated GRPO question must differ from the source question")
+
+    plan = validate_planner_plan(annotation["plan"])
+    hop_count = len(plan["queries"])
+    if hop_count not in {2, 3, 4}:
+        raise ValueError("Generated GRPO plan must contain two to four queries")
+    if not any(query["depends_on"] for query in plan["queries"]):
+        raise ValueError("Generated GRPO plan must contain at least one dependency")
+
+    hop_answers = annotation["hop_answers"]
+    evidence_indices = annotation["hop_evidence_indices"]
+    if not isinstance(hop_answers, list) or len(hop_answers) != hop_count:
+        raise ValueError("Generated GRPO hop_answers must match the query count")
+    if not isinstance(evidence_indices, list) or len(evidence_indices) != hop_count:
+        raise ValueError("Generated GRPO evidence indices must match the query count")
+    if not all(isinstance(index, int) for index in evidence_indices):
+        raise ValueError("Generated GRPO evidence indices must be integers")
+    if len(set(evidence_indices)) != hop_count:
+        raise ValueError("Generated GRPO hops must use distinct evidence indices")
+
+    evidence_items = request["evidence_items"]
+    selected_doc_ids = []
+    for answer, evidence_index in zip(hop_answers, evidence_indices):
+        if not isinstance(answer, str) or not answer.strip():
+            raise ValueError("Generated GRPO hop answers must be non-empty strings")
+        if not 0 <= evidence_index < len(evidence_items):
+            raise ValueError("Generated GRPO evidence index is out of range")
+        evidence_item = evidence_items[evidence_index]
+        answer_key = normalized_key(answer)
+        if not answer_key or answer_key not in normalized_key(evidence_item["text"]):
+            raise ValueError("Generated GRPO hop answer is not grounded in its evidence")
+        selected_doc_ids.append(evidence_item["gold_doc_id"])
+    if len(set(selected_doc_ids)) != hop_count:
+        raise ValueError("Generated GRPO hops must use distinct policy chunks")
+
+    selected_evidence = " ".join(
+        evidence_items[index]["text"]
+        for index in evidence_indices
+    )
+    reference_key = normalized_key(annotation["reference_answer"])
+    final_hop_key = normalized_key(hop_answers[-1])
+    if not reference_key or reference_key not in normalized_key(selected_evidence):
+        raise ValueError("Generated GRPO reference answer is not grounded in selected evidence")
+    if reference_key not in final_hop_key and final_hop_key not in reference_key:
+        raise ValueError("Generated GRPO reference answer must match the final hop answer")
+    serialized_plan = json.dumps(plan, ensure_ascii = False, separators = (",", ":"))
+    serialized_key = normalized_key(serialized_plan)
+    leaked_answers = [
+        answer
+        for answer in reference_answer_fragments(annotation["reference_answer"])
+        if answer in serialized_key
+    ]
+    if leaked_answers:
+        raise ValueError("Generated plan leaks the reference answer")
+    annotation["plan"] = plan
+    annotation["gold_doc_ids"] = selected_doc_ids
+    return annotation
+
+
 def validate_generated_plan(
     request: dict[str, Any],
     response_text: str
@@ -175,6 +265,13 @@ def validate_generated_plan(
     """
     if response_text == "dummy_result":
         raise ValueError("Ark helper returned dummy_result")
+    if request["stage"] == "grpo":
+        annotation = validate_grpo_annotation(request, response_text)
+        return json.dumps(
+            annotation["plan"],
+            ensure_ascii = False,
+            separators = (",", ":")
+        )
     plan = extract_json_object(response_text)
     validate_planner_plan(plan)
     serialized = json.dumps(plan, ensure_ascii = False, separators = (",", ":"))
@@ -183,17 +280,6 @@ def validate_generated_plan(
     if request["stage"] == "dpo" and request["payload"]["task_type"] == "single_hop":
         if len(plan["queries"]) != 1:
             raise ValueError("Generated single-hop DPO negative must contain one query")
-    if request["stage"] == "grpo":
-        if len(plan["queries"]) < 2:
-            raise ValueError("Generated GRPO plan must contain two to four queries")
-        serialized_key = normalized_key(serialized)
-        leaked_answers = [
-            answer
-            for answer in reference_answer_fragments(request.get("reference_answer", ""))
-            if answer in serialized_key
-        ]
-        if leaked_answers:
-            raise ValueError("Generated plan leaks the reference answer")
     return serialized
 
 
@@ -233,6 +319,19 @@ def build_response_record(
         record["target_record_id"] = request["target_record_id"]
     try:
         record["parsed_output"] = validate_generated_plan(request, response_text)
+        if request["stage"] == "grpo":
+            annotation = validate_grpo_annotation(request, response_text)
+            record.update(
+                {
+                    "generated_scenario": annotation["scenario"],
+                    "generated_question": annotation["question"],
+                    "hop_answers": annotation["hop_answers"],
+                    "hop_evidence_indices": annotation["hop_evidence_indices"],
+                    "reference_answer": annotation["reference_answer"],
+                    "gold_doc_ids": annotation["gold_doc_ids"],
+                    "variant_index": request["variant_index"]
+                }
+            )
     except ValueError as error:
         record["status"] = "invalid"
         record["error"] = str(error)
@@ -293,6 +392,38 @@ def token_value(value: int | str) -> int:
         return 0
 
 
+def sort_response_file(path: Path, requests: list[dict[str, Any]]) -> None:
+    """Rewrite responses in request order while preserving obsolete records.
+
+    Args:
+        path: Response JSONL path to normalize.
+        requests: Complete ordered request queue.
+    """
+    if not path.exists():
+        return
+    all_records = read_jsonl(path)
+    latest_records = {
+        record["id"]: record
+        for record in all_records
+    }
+    request_ids = {request["id"] for request in requests}
+    ordered_records = [
+        latest_records[request["id"]]
+        for request in requests
+        if request["id"] in latest_records
+    ]
+    ordered_records.extend(
+        record
+        for record_id, record in latest_records.items()
+        if record_id not in request_ids
+    )
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding = "utf-8") as file:
+        for record in ordered_records:
+            file.write(json.dumps(record, ensure_ascii = False) + "\n")
+    temporary_path.replace(path)
+
+
 def run_dry_run(stage: str, requests: list[dict[str, Any]], limit: int | None) -> None:
     """Log queue details without making an API call.
 
@@ -340,11 +471,15 @@ def main() -> None:
         and completed_requests[request["id"]] != request.get("request_hash", "")
     ]
     if stale_ids:
-        raise ValueError(
-            "Response file contains stale requests; archive it before retrying: "
-            + ", ".join(stale_ids[:5])
+        logger.warning(
+            "Regenerating %d stale responses whose request hashes changed",
+            len(stale_ids)
         )
-    pending = [request for request in requests if request["id"] not in completed_requests]
+    pending = [
+        request
+        for request in requests
+        if completed_requests.get(request["id"]) != request.get("request_hash", "")
+    ]
     if args.limit is not None:
         pending = pending[:args.limit]
     response_path.parent.mkdir(parents = True, exist_ok = True)
@@ -367,14 +502,27 @@ def main() -> None:
                     request,
                     args.reasoning_option,
                     args.max_retries
-                ): request["id"]
-                for request in pending
+                ): (index, request)
+                for index, request in enumerate(pending)
             }
+            buffered_records = {}
+            next_write_index = 0
             progress = tqdm(total = len(futures), desc = f"Generating {args.stage}")
             for completed_count, future in enumerate(as_completed(futures), start = 1):
-                response_record = future.result()
-                file.write(json.dumps(response_record, ensure_ascii = False) + "\n")
-                file.flush()
+                request_index, request = futures[future]
+                try:
+                    response_record = future.result()
+                except Exception as error:
+                    logger.exception("Worker failed for request %s", request["id"])
+                    response_record = build_response_record(request, None, "dummy_result", "", "")
+                    response_record["error"] = f"Worker failed: {error}"
+                    response_record["attempts"] = 0
+                buffered_records[request_index] = response_record
+                while next_write_index in buffered_records:
+                    ordered_record = buffered_records.pop(next_write_index)
+                    file.write(json.dumps(ordered_record, ensure_ascii = False) + "\n")
+                    file.flush()
+                    next_write_index += 1
                 if response_record["status"] == "success":
                     success_count += 1
                 else:
@@ -395,6 +543,8 @@ def main() -> None:
                         completion_token_count
                     )
             progress.close()
+    sort_response_file(response_path, requests)
+    logger.info("Response file normalized to request order: %s", response_path)
 
 
 if __name__ == "__main__":
