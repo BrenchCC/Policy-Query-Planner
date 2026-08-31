@@ -164,21 +164,42 @@
     },
     "dpo_count": 5000,
     "dpo_mix": {
-      "qrecc": 4000,
-      "conditionalqa": 1000
+      "qrecc": 2000,
+      "musique": 2500,
+      "conditionalqa": 500
+    },
+    "dpo_task_mix": {
+      "single_hop": 2500,
+      "multi_hop": 2500
+    },
+    "dpo_hop_mix": {
+      "1": 2500,
+      "2": 1250,
+      "3": 1000,
+      "4": 250
     },
     "dpo_error_mix": {
-      "entity_omission": 1000,
-      "unresolved_reference": 1000,
-      "constraint_omission": 1000,
-      "overly_broad": 1000,
-      "wrong_context": 1000
+      "entity_omission": 500,
+      "broken_dependency": 500,
+      "step_omission": 500,
+      "redundant_step": 500,
+      "unresolved_reference": 500,
+      "overly_broad": 500,
+      "constraint_omission": 500,
+      "overly_broad_step": 500,
+      "wrong_context": 500,
+      "relation_omission": 500
     },
     "grpo_count": 5000,
+    "grpo_task_mix": {
+      "single_hop": 1000,
+      "multi_hop": 4000
+    },
     "grpo_hop_mix": {
-      "2": 3242,
-      "3": 1200,
-      "4": 558
+      "1": 1000,
+      "3": 910,
+      "2": 2586,
+      "4": 504
     }
   }
 }

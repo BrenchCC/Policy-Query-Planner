@@ -86,7 +86,7 @@ def prepare_sft_requests() -> list[dict[str, Any]]:
 
 
 def prepare_dpo_requests() -> list[dict[str, Any]]:
-    """Prepare hard-negative preference requests.
+    """Prepare policy single-hop and MuSiQue multi-hop negative requests.
 
     Returns:
         DPO generation request records.
@@ -94,20 +94,22 @@ def prepare_dpo_requests() -> list[dict[str, Any]]:
     records = [
         record
         for record in read_jsonl(PROCESSED_ROOT / "train" / "dpo_train.jsonl")
-        if record["source_dataset"] == "conditionalqa"
+        if record["source_dataset"] in {"conditionalqa", "musique"}
     ]
     requests = []
     for record in records:
         payload = {
             "user_input": record["input"],
             "chosen": record["chosen"],
-            "error_type": record["error_type"]
+            "error_type": record["error_type"],
+            "task_type": record["task_type"],
+            "hop_count": record["hop_count"]
         }
         requests.append(
             {
                 "id": "api_" + record["id"],
                 "stage": "dpo",
-                "source_dataset": "conditionalqa",
+                "source_dataset": record["source_dataset"],
                 "source_id": record["source_id"],
                 "target_record_id": record["id"],
                 "system": PLANNER_SYSTEM_PROMPT,

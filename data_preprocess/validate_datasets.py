@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import argparse
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,9 @@ from data_preprocess.config import (
     REQUEST_ROOT,
     TARGET_COUNTS,
     GRPO_HOP_MINIMUM,
+    GRPO_SINGLE_COUNT,
+    DPO_SINGLE_SOURCE_QUOTAS,
+    DPO_MULTIHOP_HOP_QUOTAS,
     EXPECTED_QRECC_COUNTS,
     QRECC_ARCHIVE_SHA256,
     MULTIHOP_COLD_START_HOP_QUOTAS,
@@ -218,7 +222,14 @@ def validate_train() -> None:
         normalized_key(record["question"])
         for record in read_jsonl(INTERIM_ROOT / "musique_dev.jsonl")
     }
-    for record in cold_start_records + grpo_records:
+    multihop_dpo_records = [
+        record
+        for record in dpo_records
+        if record["task_type"] == "multi_hop"
+    ]
+    for record in cold_start_records + multihop_dpo_records + grpo_records:
+        if record["source_dataset"] != "musique":
+            continue
         if record["source_id"] not in musique_train:
             raise ValueError(f"MuSiQue source is not in train: {record['id']}")
         question_key = normalized_key(musique_train[record["source_id"]]["question"])
@@ -226,9 +237,18 @@ def validate_train() -> None:
             raise ValueError(f"MuSiQue content leakage detected: {record['id']}")
 
     cold_source_ids = {record["source_id"] for record in cold_start_records}
-    grpo_source_ids = {record["source_id"] for record in grpo_records}
-    if cold_source_ids.intersection(grpo_source_ids):
-        raise ValueError("Multi-hop cold-start and GRPO source IDs overlap")
+    dpo_multihop_source_ids = {record["source_id"] for record in multihop_dpo_records}
+    grpo_source_ids = {
+        record["source_id"]
+        for record in grpo_records
+        if record["task_type"] == "multi_hop"
+    }
+    if (
+        cold_source_ids.intersection(dpo_multihop_source_ids)
+        or cold_source_ids.intersection(grpo_source_ids)
+        or dpo_multihop_source_ids.intersection(grpo_source_ids)
+    ):
+        raise ValueError("Multi-hop SFT, DPO, and GRPO source IDs overlap")
     cold_question_keys = {
         normalized_key(musique_train[source_id]["question"])
         for source_id in cold_source_ids
@@ -237,8 +257,16 @@ def validate_train() -> None:
         normalized_key(musique_train[source_id]["question"])
         for source_id in grpo_source_ids
     }
-    if cold_question_keys.intersection(grpo_question_keys):
-        raise ValueError("Multi-hop cold-start and GRPO question fingerprints overlap")
+    dpo_multihop_question_keys = {
+        normalized_key(musique_train[source_id]["question"])
+        for source_id in dpo_multihop_source_ids
+    }
+    if (
+        cold_question_keys.intersection(dpo_multihop_question_keys)
+        or cold_question_keys.intersection(grpo_question_keys)
+        or dpo_multihop_question_keys.intersection(grpo_question_keys)
+    ):
+        raise ValueError("Multi-hop SFT, DPO, and GRPO question fingerprints overlap")
 
     cold_hop_counts = {}
     for record in cold_start_records:
@@ -246,6 +274,27 @@ def validate_train() -> None:
         cold_hop_counts[hop_count] = cold_hop_counts.get(hop_count, 0) + 1
     if cold_hop_counts != MULTIHOP_COLD_START_HOP_QUOTAS:
         raise ValueError(f"Unexpected cold-start hop distribution: {cold_hop_counts}")
+    dpo_task_counts = Counter(record["task_type"] for record in dpo_records)
+    if dpo_task_counts != {"single_hop": 2500, "multi_hop": 2500}:
+        raise ValueError(f"Unexpected DPO task distribution: {dpo_task_counts}")
+    dpo_multihop_hop_counts = Counter(record["hop_count"] for record in multihop_dpo_records)
+    if dpo_multihop_hop_counts != DPO_MULTIHOP_HOP_QUOTAS:
+        raise ValueError(f"Unexpected multi-hop DPO distribution: {dpo_multihop_hop_counts}")
+    dpo_single_source_counts = Counter(
+        record["source_dataset"]
+        for record in dpo_records
+        if record["task_type"] == "single_hop"
+    )
+    if dpo_single_source_counts != DPO_SINGLE_SOURCE_QUOTAS:
+        raise ValueError(f"Unexpected single-hop DPO sources: {dpo_single_source_counts}")
+
+    grpo_task_counts = Counter(record["task_type"] for record in grpo_records)
+    expected_grpo_tasks = {
+        "single_hop": GRPO_SINGLE_COUNT,
+        "multi_hop": TARGET_COUNTS["grpo"] - GRPO_SINGLE_COUNT
+    }
+    if grpo_task_counts != expected_grpo_tasks:
+        raise ValueError(f"Unexpected GRPO task distribution: {grpo_task_counts}")
     grpo_hop_counts = {}
     for record in grpo_records:
         hop_count = record["hop_count"]
@@ -260,8 +309,21 @@ def validate_train() -> None:
     error_counts = {}
     for record in dpo_records:
         error_counts[record["error_type"]] = error_counts.get(record["error_type"], 0) + 1
-    if set(error_counts.values()) != {1000}:
+    if len(error_counts) != 10 or set(error_counts.values()) != {500}:
         raise ValueError(f"DPO error categories are not balanced: {error_counts}")
+
+    dpo_policy_ids = {
+        record["source_id"]
+        for record in dpo_records
+        if record["source_dataset"] == "conditionalqa"
+    }
+    grpo_single_policy_ids = {
+        record["source_id"]
+        for record in grpo_records
+        if record["task_type"] == "single_hop"
+    }
+    if dpo_policy_ids.intersection(grpo_single_policy_ids):
+        raise ValueError("Single-hop DPO and GRPO policy sources overlap")
     dataset_info_path = PROCESSED_ROOT / "dataset_info.json"
     if not dataset_info_path.exists():
         raise FileNotFoundError("Missing LLaMA-Factory dataset_info.json")
@@ -286,7 +348,7 @@ def validate_train() -> None:
             for record in augmented_records
             if record["namespace"] == "policy"
         ]
-        if len(augmented_musique) != 4000 or len(augmented_policy) != 1000:
+        if len(augmented_musique) != 3000 or len(augmented_policy) != 2000:
             raise ValueError("Unexpected domain-augmented GRPO mixture")
         augmented_source_ids = {record["source_id"] for record in augmented_musique}
         if not augmented_source_ids.issubset(grpo_source_ids):
@@ -298,7 +360,7 @@ def validate_train() -> None:
 
 def validate_api() -> None:
     """Validate optional generation request queues."""
-    expected_counts = {"sft": 2338, "dpo": 1000, "grpo": 1811}
+    expected_counts = {"sft": 2338, "dpo": 3000, "grpo": 1811}
     for stage, expected_count in expected_counts.items():
         records = read_jsonl(REQUEST_ROOT / f"{stage}_requests.jsonl")
         if len(records) != expected_count:

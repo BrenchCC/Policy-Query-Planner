@@ -124,7 +124,7 @@ def flatten_answers(answers: list[Any]) -> str:
 
 
 def finalize_grpo() -> dict[str, int]:
-    """Create the 4K MuSiQue plus 1K policy GRPO mixture.
+    """Create a 1K single-policy plus 3K MuSiQue plus 1K multi-policy mixture.
 
     Returns:
         Merge statistics.
@@ -158,6 +158,7 @@ def finalize_grpo() -> dict[str, int]:
             "source_id": source["id"],
             "namespace": "policy",
             "hop_count": len(plan["queries"]),
+            "task_type": "multi_hop",
             "reference_answer": flatten_answers(source["answers"]),
             "answer_aliases": [],
             "hop_answers": [],
@@ -176,9 +177,11 @@ def finalize_grpo() -> dict[str, int]:
         )
 
     baseline = read_jsonl(PROCESSED_ROOT / "train" / "grpo_train.jsonl")
-    selected_baseline = stratified_sample(
-        baseline,
-        4000,
+    single_baseline = [record for record in baseline if record["task_type"] == "single_hop"]
+    multi_baseline = [record for record in baseline if record["task_type"] == "multi_hop"]
+    selected_baseline = single_baseline + stratified_sample(
+        multi_baseline,
+        3000,
         lambda record: record["hop_count"],
         RANDOM_SEED + 20
     )

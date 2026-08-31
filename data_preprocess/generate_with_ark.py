@@ -1,12 +1,36 @@
 import os
 import sys
 import json
+import time
 import logging
 import argparse
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
+
+
+def load_local_environment() -> None:
+    """Load ignored project .env values without overriding process variables."""
+    environment_path = Path(__file__).resolve().parents[1] / ".env"
+    if environment_path.exists():
+        for raw_line in environment_path.read_text(encoding = "utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.removeprefix("export ").split("=", 1)
+            name = name.strip()
+            value = value.strip().strip("\"'")
+            if name and value:
+                os.environ.setdefault(name, value)
+    if os.environ.get("LLM_BASE_URL"):
+        os.environ.setdefault("LLM_API_BASE_URL", os.environ["LLM_BASE_URL"])
+    if os.environ.get("MODEL"):
+        os.environ.setdefault("LLM_ENDPOINT", os.environ["MODEL"])
+
+
+load_local_environment()
 
 # Add project root to Python path
 sys.path.append(os.getcwd())
@@ -17,6 +41,51 @@ from data_preprocess.config import LLM_ENDPOINT, REQUEST_ROOT, RESPONSE_ROOT
 from data_preprocess.schemas import validate_planner_plan
 
 logger = logging.getLogger(__name__)
+
+
+class ExcludeHttpConsoleFilter(logging.Filter):
+    """Hide verbose HTTP client INFO records from the terminal only."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Decide whether a log record should appear in the terminal.
+
+        Args:
+            record: Candidate logging record.
+
+        Returns:
+            False for httpx and httpcore records, otherwise True.
+        """
+        return not record.name.startswith(("httpx", "httpcore"))
+
+
+def configure_logging(stage: str) -> Path:
+    """Configure complete file logs and concise terminal logs.
+
+    Args:
+        stage: Generation stage used in the log filename.
+
+    Returns:
+        Path of the append-only full log file.
+    """
+    log_root = Path(__file__).resolve().parents[1] / "logs"
+    log_root.mkdir(parents = True, exist_ok = True)
+    log_path = log_root / f"generate_with_ark_{stage}.log"
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    file_handler = logging.FileHandler(log_path, encoding = "utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(ExcludeHttpConsoleFilter())
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    return log_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +99,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action = "store_true", help = "Inspect requests without API calls")
     parser.add_argument("--resume", action = "store_true", help = "Skip completed request IDs")
     parser.add_argument("--limit", type = int, default = None, help = "Maximum requests to process")
+    parser.add_argument("--workers", type = int, default = 4, help = "Concurrent API workers")
+    parser.add_argument(
+        "--max-retries",
+        type = int,
+        default = 2,
+        help = "Retries after an API or validation failure"
+    )
+    parser.add_argument(
+        "--log-every",
+        type = int,
+        default = 10,
+        help = "Log aggregate progress every N completed requests"
+    )
     parser.add_argument(
         "--reasoning-option",
         default = None,
@@ -39,7 +121,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_completed_requests(path: Path) -> dict[str, str]:
-    """Load request IDs and hashes already present in a response file.
+    """Load successfully completed request IDs and hashes.
 
     Args:
         path: Response JSONL path.
@@ -52,6 +134,7 @@ def load_completed_requests(path: Path) -> dict[str, str]:
     return {
         record["id"]: record.get("request_hash", "")
         for record in read_jsonl(path)
+        if record.get("status") == "success"
     }
 
 
@@ -97,6 +180,9 @@ def validate_generated_plan(
     serialized = json.dumps(plan, ensure_ascii = False, separators = (",", ":"))
     if request["stage"] == "dpo" and serialized == request["payload"]["chosen"]:
         raise ValueError("Generated rejected plan equals the chosen plan")
+    if request["stage"] == "dpo" and request["payload"]["task_type"] == "single_hop":
+        if len(plan["queries"]) != 1:
+            raise ValueError("Generated single-hop DPO negative must contain one query")
     if request["stage"] == "grpo":
         if len(plan["queries"]) < 2:
             raise ValueError("Generated GRPO plan must contain two to four queries")
@@ -153,6 +239,60 @@ def build_response_record(
     return record
 
 
+def generate_response(
+    request: dict[str, Any],
+    reasoning_option: str | None,
+    max_retries: int
+) -> dict[str, Any]:
+    """Generate and validate one response with bounded retries.
+
+    Args:
+        request: Prepared generation request.
+        reasoning_option: Optional Ark thinking mode.
+        max_retries: Number of retries after the initial attempt.
+
+    Returns:
+        Final validated or invalid response record.
+    """
+    response_record = {}
+    for attempt in range(max_retries + 1):
+        reasoning, result, prompt_tokens, completion_tokens = call_llm_on_volcengine(
+            request["prompt"],
+            LLM_ENDPOINT,
+            system_prompt = request["system"],
+            stream = False,
+            reasoning_option = reasoning_option
+        )
+        response_record = build_response_record(
+            request,
+            reasoning,
+            result,
+            prompt_tokens,
+            completion_tokens
+        )
+        response_record["attempts"] = attempt + 1
+        if response_record["status"] == "success":
+            return response_record
+        if attempt < max_retries:
+            time.sleep(min(2 ** attempt, 8))
+    return response_record
+
+
+def token_value(value: int | str) -> int:
+    """Convert an optional API token count to an integer.
+
+    Args:
+        value: Integer token count or an empty string.
+
+    Returns:
+        Parsed token count, or zero when unavailable.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def run_dry_run(stage: str, requests: list[dict[str, Any]], limit: int | None) -> None:
     """Log queue details without making an API call.
 
@@ -171,6 +311,8 @@ def run_dry_run(stage: str, requests: list[dict[str, Any]], limit: int | None) -
 def main() -> None:
     """Run or inspect one optional Ark generation stage."""
     args = parse_args()
+    log_path = configure_logging(args.stage)
+    logger.info("Full log file: %s", log_path)
     request_path = REQUEST_ROOT / f"{args.stage}_requests.jsonl"
     if not request_path.exists():
         raise FileNotFoundError(f"Prepare requests first: {request_path}")
@@ -180,6 +322,12 @@ def main() -> None:
         return
     if not LLM_ENDPOINT:
         raise RuntimeError("Missing LLM_ENDPOINT in environment")
+    if args.workers < 1:
+        raise ValueError("--workers must be at least 1")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries cannot be negative")
+    if args.log_every < 1:
+        raise ValueError("--log-every must be at least 1")
 
     response_path = RESPONSE_ROOT / f"{args.stage}_responses.jsonl"
     if response_path.exists() and not args.resume:
@@ -200,30 +348,54 @@ def main() -> None:
     if args.limit is not None:
         pending = pending[:args.limit]
     response_path.parent.mkdir(parents = True, exist_ok = True)
+    success_count = 0
+    invalid_count = 0
+    prompt_token_count = 0
+    completion_token_count = 0
+    logger.info(
+        "Starting stage=%s pending=%d workers=%d max_retries=%d",
+        args.stage,
+        len(pending),
+        args.workers,
+        args.max_retries
+    )
     with response_path.open("a", encoding = "utf-8") as file:
-        for request in tqdm(pending, desc = f"Generating {args.stage}"):
-            reasoning, result, prompt_tokens, completion_tokens = call_llm_on_volcengine(
-                request["prompt"],
-                LLM_ENDPOINT,
-                system_prompt = request["system"],
-                stream = False,
-                reasoning_option = args.reasoning_option
-            )
-            response_record = build_response_record(
-                request,
-                reasoning,
-                result,
-                prompt_tokens,
-                completion_tokens
-            )
-            file.write(json.dumps(response_record, ensure_ascii = False) + "\n")
-            file.flush()
+        with ThreadPoolExecutor(max_workers = args.workers) as executor:
+            futures = {
+                executor.submit(
+                    generate_response,
+                    request,
+                    args.reasoning_option,
+                    args.max_retries
+                ): request["id"]
+                for request in pending
+            }
+            progress = tqdm(total = len(futures), desc = f"Generating {args.stage}")
+            for completed_count, future in enumerate(as_completed(futures), start = 1):
+                response_record = future.result()
+                file.write(json.dumps(response_record, ensure_ascii = False) + "\n")
+                file.flush()
+                if response_record["status"] == "success":
+                    success_count += 1
+                else:
+                    invalid_count += 1
+                prompt_token_count += token_value(response_record["prompt_tokens"])
+                completion_token_count += token_value(response_record["completion_tokens"])
+                progress.update(1)
+                if completed_count % args.log_every == 0 or completed_count == len(futures):
+                    logger.info(
+                        "Progress stage=%s completed=%d/%d success=%d invalid=%d "
+                        "prompt_tokens=%d completion_tokens=%d",
+                        args.stage,
+                        completed_count,
+                        len(futures),
+                        success_count,
+                        invalid_count,
+                        prompt_token_count,
+                        completion_token_count
+                    )
+            progress.close()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level = logging.INFO,
-        format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers = [logging.StreamHandler()]
-    )
     main()

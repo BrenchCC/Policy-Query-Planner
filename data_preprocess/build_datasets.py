@@ -28,6 +28,10 @@ from data_preprocess.config import (
     RANDOM_SEED,
     TARGET_COUNTS,
     GRPO_HOP_MINIMUM,
+    GRPO_SINGLE_COUNT,
+    GRPO_MULTIHOP_COUNT,
+    DPO_SINGLE_SOURCE_QUOTAS,
+    DPO_MULTIHOP_HOP_QUOTAS,
     MULTIHOP_COLD_START_HOP_QUOTAS,
     PLANNER_SYSTEM_PROMPT
 )
@@ -45,17 +49,25 @@ SFT_INSTRUCTION = (
     "Rewrite the current question as a standalone retrieval query. Return a JSON query plan only "
     "and do not answer the question."
 )
-DPO_INSTRUCTION = SFT_INSTRUCTION
 GRPO_INSTRUCTION = (
-    "Decompose the multi-hop question into ordered retrieval queries. Return a JSON query plan only "
-    "and do not answer the question."
+    "Create the minimum sufficient retrieval query plan. Use one standalone query when it is "
+    "sufficient; otherwise use ordered queries with explicit dependencies. Return JSON only and "
+    "do not answer the question."
 )
+DPO_INSTRUCTION = GRPO_INSTRUCTION
 ERROR_TYPES = [
     "unresolved_reference",
     "entity_omission",
     "constraint_omission",
     "overly_broad",
     "wrong_context"
+]
+MULTIHOP_ERROR_TYPES = [
+    "step_omission",
+    "broken_dependency",
+    "redundant_step",
+    "overly_broad_step",
+    "relation_omission"
 ]
 
 
@@ -367,14 +379,16 @@ def make_rejected_query(
 def build_dpo_records(
     qrecc_train: list[dict[str, Any]],
     conditional_train: list[dict[str, Any]],
-    policy_plans: dict[str, str]
+    policy_plans: dict[str, str],
+    multihop_records: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Build the exact 5K preference mixture.
+    """Build the exact 5K single-hop and multi-hop preference mixture.
 
     Args:
         qrecc_train: Clean QReCC training records.
         conditional_train: Clean ConditionalQA training records.
         policy_plans: Correct ConditionalQA plan mapping.
+        multihop_records: Disjoint MuSiQue records for multi-hop preference learning.
 
     Returns:
         Validated DPO records.
@@ -382,13 +396,13 @@ def build_dpo_records(
     qrecc_candidates = [record for record in qrecc_train if record["nontrivial_rewrite"]]
     selected_qrecc = stratified_sample(
         qrecc_candidates,
-        4000,
+        DPO_SINGLE_SOURCE_QUOTAS["qrecc"],
         lambda record: (record["conversation_source"], record["context_turns"]),
         RANDOM_SEED + 2
     )
     selected_policy = stratified_sample(
         conditional_train,
-        1000,
+        DPO_SINGLE_SOURCE_QUOTAS["conditionalqa"],
         lambda record: (record["not_answerable"], min(len(record["evidences"]), 3)),
         RANDOM_SEED + 3
     )
@@ -408,6 +422,8 @@ def build_dpo_records(
             "system": PLANNER_SYSTEM_PROMPT,
             "source_dataset": "qrecc",
             "source_id": record["id"],
+            "task_type": "single_hop",
+            "hop_count": 1,
             "error_type": error_type
         }
         validate_dpo_record(dpo_record)
@@ -434,6 +450,28 @@ def build_dpo_records(
             "system": PLANNER_SYSTEM_PROMPT,
             "source_dataset": "conditionalqa",
             "source_id": record["id"],
+            "task_type": "single_hop",
+            "hop_count": 1,
+            "error_type": error_type
+        }
+        validate_dpo_record(dpo_record)
+        dpo_records.append(dpo_record)
+
+    for index, record in enumerate(multihop_records):
+        error_type = MULTIHOP_ERROR_TYPES[index % len(MULTIHOP_ERROR_TYPES)]
+        chosen_plan = convert_musique_plan(record)
+        dpo_record = {
+            "id": "dpo_musique_" + record["id"],
+            "instruction": DPO_INSTRUCTION,
+            "input": f"Question:\n{record['question']}",
+            "chosen": chosen_plan,
+            "rejected": make_rejected_multihop_plan(chosen_plan, error_type),
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "musique",
+            "source_id": record["id"],
+            "task_type": "multi_hop",
+            "namespace": "musique_aux",
+            "hop_count": record["hop_count"],
             "error_type": error_type
         }
         validate_dpo_record(dpo_record)
@@ -443,6 +481,57 @@ def build_dpo_records(
     if len(dpo_records) != TARGET_COUNTS["dpo"]:
         raise ValueError(f"Unexpected DPO count: {len(dpo_records)}")
     return dpo_records
+
+
+def make_rejected_multihop_plan(chosen_plan: str, error_type: str) -> str:
+    """Create one structurally valid but weaker multi-hop plan.
+
+    Args:
+        chosen_plan: Correct dependency-aware plan.
+        error_type: Requested multi-hop planning error.
+
+    Returns:
+        Serialized rejected plan with one primary planning defect.
+    """
+    queries = json.loads(chosen_plan)["queries"]
+    rejected_queries = [dict(query) for query in queries]
+    if error_type == "step_omission":
+        rejected_queries = rejected_queries[:-1]
+    elif error_type == "broken_dependency":
+        target = next(
+            (query for query in rejected_queries if query["depends_on"]),
+            rejected_queries[-1]
+        )
+        target["query"] = re.sub(
+            r"\{\{q[1-4]\.answer\}\}",
+            "the intermediate entity",
+            target["query"]
+        )
+        target["depends_on"] = []
+    elif error_type == "redundant_step":
+        rejected_queries[-1] = {
+            "id": rejected_queries[-1]["id"],
+            "query": rejected_queries[0]["query"],
+            "depends_on": []
+        }
+    elif error_type == "overly_broad_step":
+        rejected_queries[-1] = {
+            "id": rejected_queries[-1]["id"],
+            "query": "General background information about the topic",
+            "depends_on": []
+        }
+    elif error_type == "relation_omission":
+        target = rejected_queries[-1]
+        plain_query = re.sub(r"\{\{q[1-4]\.answer\}\}", "the entity", target["query"])
+        words = plain_query.split()
+        target["query"] = " ".join(words[:max(3, math.ceil(len(words) * 0.6))])
+        target["depends_on"] = []
+    else:
+        raise ValueError(f"Unsupported multi-hop DPO error type: {error_type}")
+    rejected_plan = serialize_plan(rejected_queries)
+    if rejected_plan == chosen_plan:
+        raise ValueError("Multi-hop rejected plan must differ from the chosen plan")
+    return rejected_plan
 
 
 def json_query(plan: str) -> str:
@@ -532,19 +621,26 @@ def proportional_allocations(
 def allocate_multihop_records(
     records: list[dict[str, Any]],
     cold_start_quotas: dict[int, int],
+    dpo_quotas: dict[int, int],
     grpo_target_count: int,
     seed: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[int, int]]:
-    """Jointly allocate disjoint cold-start and GRPO MuSiQue records.
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[int, int]
+]:
+    """Jointly allocate disjoint SFT, DPO, and GRPO MuSiQue records.
 
     Args:
         records: MuSiQue training records.
         cold_start_quotas: Exact 2/3/4-hop cold-start quotas.
+        dpo_quotas: Exact 2/3/4-hop DPO quotas.
         grpo_target_count: Exact requested GRPO count.
         seed: Deterministic sampling seed.
 
     Returns:
-        Cold-start records, GRPO records, and GRPO hop allocations.
+        Cold-start records, DPO records, GRPO records, and GRPO hop allocations.
 
     Raises:
         ValueError: If inputs are duplicated or capacity is insufficient.
@@ -566,15 +662,18 @@ def allocate_multihop_records(
         groups[record["hop_count"]].append(record)
 
     cold_start_records = []
+    dpo_records = []
     remaining_groups: dict[int, list[dict[str, Any]]] = {}
     for hop_count in [2, 3, 4]:
         random.Random(seed + hop_count).shuffle(groups[hop_count])
         cold_count = cold_start_quotas[hop_count]
-        required_count = cold_count + GRPO_HOP_MINIMUM
+        dpo_count = dpo_quotas[hop_count]
+        required_count = cold_count + dpo_count + GRPO_HOP_MINIMUM
         if len(groups[hop_count]) < required_count:
             raise ValueError(f"Insufficient {hop_count}-hop MuSiQue records")
         cold_start_records.extend(groups[hop_count][:cold_count])
-        remaining_groups[hop_count] = groups[hop_count][cold_count:]
+        dpo_records.extend(groups[hop_count][cold_count:cold_count + dpo_count])
+        remaining_groups[hop_count] = groups[hop_count][cold_count + dpo_count:]
 
     grpo_allocations = proportional_allocations(
         remaining_groups,
@@ -586,16 +685,27 @@ def allocate_multihop_records(
         grpo_records.extend(remaining_groups[hop_count][:grpo_allocations[hop_count]])
 
     random.Random(seed + 10).shuffle(cold_start_records)
-    random.Random(seed + 11).shuffle(grpo_records)
+    random.Random(seed + 11).shuffle(dpo_records)
+    random.Random(seed + 12).shuffle(grpo_records)
     cold_source_ids = {record["id"] for record in cold_start_records}
+    dpo_source_ids = {record["id"] for record in dpo_records}
     grpo_source_ids = {record["id"] for record in grpo_records}
-    if cold_source_ids.intersection(grpo_source_ids):
-        raise ValueError("Cold-start and GRPO source IDs overlap")
+    if (
+        cold_source_ids.intersection(dpo_source_ids)
+        or cold_source_ids.intersection(grpo_source_ids)
+        or dpo_source_ids.intersection(grpo_source_ids)
+    ):
+        raise ValueError("SFT, DPO, and GRPO multi-hop source IDs overlap")
     cold_question_keys = {musique_question_key(record) for record in cold_start_records}
+    dpo_question_keys = {musique_question_key(record) for record in dpo_records}
     grpo_question_keys = {musique_question_key(record) for record in grpo_records}
-    if cold_question_keys.intersection(grpo_question_keys):
-        raise ValueError("Cold-start and GRPO question fingerprints overlap")
-    return cold_start_records, grpo_records, grpo_allocations
+    if (
+        cold_question_keys.intersection(dpo_question_keys)
+        or cold_question_keys.intersection(grpo_question_keys)
+        or dpo_question_keys.intersection(grpo_question_keys)
+    ):
+        raise ValueError("SFT, DPO, and GRPO multi-hop question fingerprints overlap")
+    return cold_start_records, dpo_records, grpo_records, grpo_allocations
 
 
 def convert_musique_plan(record: dict[str, Any]) -> str:
@@ -667,11 +777,61 @@ def build_multihop_sft_records(
     return cold_start_records
 
 
-def build_grpo_records(selected_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build the exact 5K disjoint MuSiQue GRPO baseline.
+def flatten_reference_answers(answers: list[Any]) -> str:
+    """Flatten nested ConditionalQA answers into one reference string.
+
+    Args:
+        answers: Nested answer annotations.
+
+    Returns:
+        Deduplicated semicolon-separated reference answers.
+    """
+    values = []
+    for answer in answers:
+        if isinstance(answer, list) and answer:
+            value = normalize_text(str(answer[0]))
+            if value and value not in values:
+                values.append(value)
+    return "; ".join(values) or "not answerable"
+
+
+def select_grpo_single_records(
+    conditional_train: list[dict[str, Any]],
+    excluded_source_ids: set[str]
+) -> list[dict[str, Any]]:
+    """Select single-hop policy regularizers outside the DPO policy subset.
+
+    Args:
+        conditional_train: Clean ConditionalQA training records.
+        excluded_source_ids: Source IDs already used for policy DPO.
+
+    Returns:
+        Deterministically stratified single-hop GRPO source records.
+    """
+    candidates = [
+        record
+        for record in conditional_train
+        if record["id"] not in excluded_source_ids and record["gold_doc_ids"]
+    ]
+    return stratified_sample(
+        candidates,
+        GRPO_SINGLE_COUNT,
+        lambda record: (record["not_answerable"], min(len(record["evidences"]), 3)),
+        RANDOM_SEED + 13
+    )
+
+
+def build_grpo_records(
+    selected_records: list[dict[str, Any]],
+    single_policy_records: list[dict[str, Any]],
+    policy_plans: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Build a 1K single-hop plus 4K multi-hop GRPO-ready mixture.
 
     Args:
         selected_records: Disjoint MuSiQue records selected for GRPO.
+        single_policy_records: ConditionalQA records used to prevent over-decomposition.
+        policy_plans: Correct one-query policy plan mapping.
 
     Returns:
         Validated GRPO-compatible records.
@@ -688,6 +848,7 @@ def build_grpo_records(selected_records: list[dict[str, Any]]) -> list[dict[str,
             "source_id": record["id"],
             "namespace": "musique_aux",
             "hop_count": record["hop_count"],
+            "task_type": "multi_hop",
             "reference_answer": record["answer"],
             "answer_aliases": record["answer_aliases"],
             "hop_answers": [step["answer"] for step in record["question_decomposition"]],
@@ -695,6 +856,27 @@ def build_grpo_records(selected_records: list[dict[str, Any]]) -> list[dict[str,
         }
         validate_grpo_record(grpo_record)
         grpo_records.append(grpo_record)
+
+    for record in single_policy_records:
+        grpo_record = {
+            "id": "grpo_single_policy_" + record["id"],
+            "instruction": GRPO_INSTRUCTION,
+            "input": f"Scenario:\n{record['scenario']}\n\nQuestion:\n{record['question']}",
+            "output": policy_plans[record["id"]],
+            "system": PLANNER_SYSTEM_PROMPT,
+            "source_dataset": "conditionalqa",
+            "source_id": record["id"],
+            "namespace": "policy",
+            "hop_count": 1,
+            "task_type": "single_hop",
+            "reference_answer": flatten_reference_answers(record["answers"]),
+            "answer_aliases": [],
+            "hop_answers": [],
+            "gold_doc_ids": record["gold_doc_ids"]
+        }
+        validate_grpo_record(grpo_record)
+        grpo_records.append(grpo_record)
+    random.Random(RANDOM_SEED + 14).shuffle(grpo_records)
     if len(grpo_records) != TARGET_COUNTS["grpo"]:
         raise ValueError(f"Unexpected GRPO count: {len(grpo_records)}")
     return grpo_records
@@ -797,15 +979,32 @@ def main() -> None:
     musique_train = read_jsonl(INTERIM_ROOT / "musique_train.jsonl")
 
     sft_records, policy_plans = build_sft_records(qrecc_train, conditional_train)
-    dpo_records = build_dpo_records(qrecc_train, conditional_train, policy_plans)
-    cold_sources, grpo_sources, grpo_allocations = allocate_multihop_records(
-        musique_train,
-        MULTIHOP_COLD_START_HOP_QUOTAS,
-        TARGET_COUNTS["grpo"],
-        RANDOM_SEED + 5
+    cold_sources, dpo_multihop_sources, grpo_sources, grpo_allocations = (
+        allocate_multihop_records(
+            musique_train,
+            MULTIHOP_COLD_START_HOP_QUOTAS,
+            DPO_MULTIHOP_HOP_QUOTAS,
+            GRPO_MULTIHOP_COUNT,
+            RANDOM_SEED + 5
+        )
+    )
+    dpo_records = build_dpo_records(
+        qrecc_train,
+        conditional_train,
+        policy_plans,
+        dpo_multihop_sources
+    )
+    dpo_policy_source_ids = {
+        record["source_id"]
+        for record in dpo_records
+        if record["source_dataset"] == "conditionalqa"
+    }
+    grpo_single_sources = select_grpo_single_records(
+        conditional_train,
+        dpo_policy_source_ids
     )
     cold_start_records = build_multihop_sft_records(cold_sources)
-    grpo_records = build_grpo_records(grpo_sources)
+    grpo_records = build_grpo_records(grpo_sources, grpo_single_sources, policy_plans)
 
     write_jsonl(PROCESSED_ROOT / "train" / "sft_train.jsonl", sft_records)
     write_jsonl(
@@ -829,27 +1028,18 @@ def main() -> None:
         ),
         "dpo_count": len(dpo_records),
         "dpo_source_counts": dict(Counter(record["source_dataset"] for record in dpo_records)),
+        "dpo_task_counts": dict(Counter(record["task_type"] for record in dpo_records)),
+        "dpo_hop_counts": dict(Counter(str(record["hop_count"]) for record in dpo_records)),
         "dpo_error_counts": dict(Counter(record["error_type"] for record in dpo_records)),
         "grpo_count": len(grpo_records),
+        "grpo_task_counts": dict(Counter(record["task_type"] for record in grpo_records)),
         "grpo_hop_counts": dict(Counter(str(record["hop_count"]) for record in grpo_records)),
         "grpo_hop_allocations": {
             str(hop_count): count
             for hop_count, count in grpo_allocations.items()
         },
-        "cold_start_grpo_source_overlap": len(
-            {record["source_id"] for record in cold_start_records}.intersection(
-                record["source_id"] for record in grpo_records
-            )
-        ),
-        "cold_start_grpo_question_overlap": len(
-            {
-                musique_question_key(record)
-                for record in cold_sources
-            }.intersection(
-                musique_question_key(record)
-                for record in grpo_sources
-            )
-        ),
+        "multihop_stage_source_overlap": 0,
+        "multihop_stage_question_overlap": 0,
         "eval_counts": eval_counts
     }
     write_json(summary_path, summary)

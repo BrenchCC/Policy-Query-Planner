@@ -126,7 +126,8 @@ def test_reject_grpo_hop_count_mismatch() -> None:
         "reference_answer": "region",
         "answer_aliases": [],
         "hop_answers": ["place", "region", "country"],
-        "gold_doc_ids": ["doc1", "doc2", "doc3"]
+        "gold_doc_ids": ["doc1", "doc2", "doc3"],
+        "task_type": "multi_hop"
     }
     with pytest.raises(ValueError, match = "query count"):
         validate_grpo_record(record)

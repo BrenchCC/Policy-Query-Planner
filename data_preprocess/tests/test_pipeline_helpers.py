@@ -7,7 +7,11 @@ from data_preprocess.common import stable_record_hash
 from data_preprocess.generate_with_ark import validate_generated_plan
 from data_preprocess.prompts import build_prompt
 from data_preprocess.clean_data import best_evidence_chunk, chunk_policy_document
-from data_preprocess.build_datasets import convert_musique_plan, make_rejected_query
+from data_preprocess.build_datasets import (
+    convert_musique_plan,
+    make_rejected_query,
+    make_rejected_multihop_plan
+)
 
 
 def test_policy_chunking_and_evidence_mapping() -> None:
@@ -62,6 +66,40 @@ def test_rejected_query_differs() -> None:
     chosen = "Paternity Leave eligibility after 26 weeks employment"
     rejected = make_rejected_query(record, chosen, "constraint_omission", "wrong topic")
     assert rejected != chosen
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "step_omission",
+        "broken_dependency",
+        "redundant_step",
+        "overly_broad_step",
+        "relation_omission"
+    ]
+)
+def test_multihop_rejected_plan_is_valid_and_different(error_type: str) -> None:
+    """Create valid hard negatives for every multi-hop planning error.
+
+    Args:
+        error_type: Multi-hop negative category under test.
+    """
+    chosen = json.dumps(
+        {
+            "queries": [
+                {"id": "q1", "query": "person birthplace", "depends_on": []},
+                {
+                    "id": "q2",
+                    "query": "{{q1.answer}} administrative region",
+                    "depends_on": ["q1"]
+                }
+            ]
+        },
+        separators = (",", ":")
+    )
+    rejected = make_rejected_multihop_plan(chosen, error_type)
+    assert rejected != chosen
+    assert json.loads(rejected)["queries"]
 
 
 def test_generation_prompt_contains_schema() -> None:
@@ -131,17 +169,19 @@ def test_multihop_allocation_is_deterministic_and_disjoint(monkeypatch) -> None:
     first = build_datasets.allocate_multihop_records(
         records,
         quotas,
+        {2: 1, 3: 1, 4: 1},
         6,
         42
     )
     second = build_datasets.allocate_multihop_records(
         records,
         quotas,
+        {2: 1, 3: 1, 4: 1},
         6,
         42
     )
-    first_cold, first_grpo, first_allocations = first
-    second_cold, second_grpo, second_allocations = second
+    first_cold, first_dpo, first_grpo, first_allocations = first
+    second_cold, second_dpo, second_grpo, second_allocations = second
     assert [record["id"] for record in first_cold] == [
         record["id"]
         for record in second_cold
@@ -150,13 +190,21 @@ def test_multihop_allocation_is_deterministic_and_disjoint(monkeypatch) -> None:
         record["id"]
         for record in second_grpo
     ]
+    assert [record["id"] for record in first_dpo] == [
+        record["id"]
+        for record in second_dpo
+    ]
     assert first_allocations == second_allocations
     assert len(first_cold) == 6
+    assert len(first_dpo) == 3
     assert len(first_grpo) == 6
     assert {
         hop_count: sum(record["hop_count"] == hop_count for record in first_cold)
         for hop_count in [2, 3, 4]
     } == quotas
     assert not {record["id"] for record in first_cold}.intersection(
+        record["id"] for record in first_grpo
+    )
+    assert not {record["id"] for record in first_dpo}.intersection(
         record["id"] for record in first_grpo
     )

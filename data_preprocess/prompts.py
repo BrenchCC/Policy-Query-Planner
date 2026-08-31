@@ -51,21 +51,29 @@ Question: {question}
 
 DPO_PROMPT_TEMPLATE = """You are creating a difficult rejected response for retrieval-query-planner preference training.
 
-The chosen plan is correct. Produce one plausible but meaningfully worse plan with the requested error type. The rejected plan must remain valid JSON and look superficially reasonable, but it must reduce retrieval quality. Do not make it nonsensical, do not answer the question, and do not change the JSON structure.
+The chosen plan is correct. Produce one plausible but meaningfully worse plan with the requested error type. The rejected plan must remain valid JSON and look superficially reasonable, but it must reduce retrieval quality. Do not make it nonsensical, do not answer the question, and do not violate the JSON schema.
 
-Error types:
+Single-hop error types:
 - unresolved_reference: keep an ambiguous pronoun or elliptical reference unresolved.
 - entity_omission: omit the central named entity, policy, or relationship.
 - constraint_omission: remove one eligibility-changing date, amount, duration, status, or condition.
 - overly_broad: replace the focused query with a generic topic query.
 - wrong_context: import a plausible but incorrect entity or constraint from the history or scenario.
 
+Multi-hop planning error types:
+- step_omission: remove one necessary retrieval step.
+- broken_dependency: remove the link between a dependent query and its prerequisite.
+- redundant_step: repeat an earlier retrieval step instead of seeking new evidence.
+- overly_broad_step: replace one focused hop with a generic topic query.
+- relation_omission: omit the relation that makes one hop retrieve the needed fact.
+
 Hard rules:
 1. Return exactly one JSON object and no Markdown.
-2. Return exactly one query with id q1 and no dependencies.
+2. Preserve valid sequential query ids and valid dependency placeholders.
 3. The rejected query must differ from the chosen query.
 4. Apply only the requested primary error type.
 5. Never include the gold answer.
+6. For single_hop, return one query. For multi_hop, keep the output superficially plausible while damaging the requested planning property.
 
 Output shape:
 {schema}
@@ -78,6 +86,8 @@ Chosen plan:
 {chosen}
 
 Required error type: {error_type}
+Task type: {task_type}
+Expected chosen hop count: {hop_count}
 """
 
 GRPO_PROMPT_TEMPLATE = """You are preparing a reference multi-hop retrieval plan for a public-policy question.

@@ -431,4 +431,3 @@ CLAUDE.md
 .claude*
 data/raw
 data/interim
-data/generation_responses/

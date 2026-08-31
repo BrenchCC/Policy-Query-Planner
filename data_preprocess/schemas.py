@@ -178,6 +178,21 @@ def validate_dpo_record(record: dict[str, Any]) -> None:
         raise ValueError("DPO chosen and rejected outputs must differ")
     validate_planner_plan(record["chosen"])
     validate_planner_plan(record["rejected"])
+    task_type = record.get("task_type")
+    hop_count = record.get("hop_count")
+    chosen_query_count = len(validate_planner_plan(record["chosen"])["queries"])
+    if task_type == "single_hop":
+        if hop_count != 1 or chosen_query_count != 1:
+            raise ValueError("Single-hop DPO records must contain one chosen query")
+    elif task_type == "multi_hop":
+        if hop_count not in {2, 3, 4} or chosen_query_count != hop_count:
+            raise ValueError("Multi-hop DPO chosen query count must match hop_count")
+        if record.get("source_dataset") != "musique":
+            raise ValueError("Multi-hop DPO records must use MuSiQue")
+        if record.get("namespace") != "musique_aux":
+            raise ValueError("Multi-hop DPO namespace must be musique_aux")
+    else:
+        raise ValueError("DPO task_type must be single_hop or multi_hop")
 
 
 def validate_grpo_record(record: dict[str, Any]) -> None:
@@ -191,8 +206,8 @@ def validate_grpo_record(record: dict[str, Any]) -> None:
     """
     validate_sft_record(record)
     hop_count = record.get("hop_count")
-    if hop_count not in {2, 3, 4}:
-        raise ValueError("GRPO hop_count must be 2, 3, or 4")
+    if hop_count not in {1, 2, 3, 4}:
+        raise ValueError("GRPO hop_count must be 1, 2, 3, or 4")
     plan = validate_planner_plan(record["output"])
     if len(plan["queries"]) != hop_count:
         raise ValueError("GRPO query count must match hop_count")
@@ -200,6 +215,10 @@ def validate_grpo_record(record: dict[str, Any]) -> None:
         raise ValueError("GRPO reference_answer must be non-empty")
     if record.get("namespace") not in {"musique_aux", "policy"}:
         raise ValueError("GRPO namespace is invalid")
+    task_type = record.get("task_type")
+    expected_task_type = "single_hop" if hop_count == 1 else "multi_hop"
+    if task_type != expected_task_type:
+        raise ValueError("GRPO task_type must match hop_count")
     hop_answers = record.get("hop_answers")
     gold_doc_ids = record.get("gold_doc_ids")
     if not isinstance(hop_answers, list):
@@ -207,10 +226,14 @@ def validate_grpo_record(record: dict[str, Any]) -> None:
     if not isinstance(gold_doc_ids, list) or not gold_doc_ids:
         raise ValueError("GRPO gold_doc_ids must be a non-empty list")
     if record["namespace"] == "musique_aux":
+        if hop_count == 1:
+            raise ValueError("MuSiQue GRPO records must be multi-hop")
         if len(hop_answers) != hop_count:
             raise ValueError("MuSiQue GRPO hop_answers must match hop_count")
         if len(gold_doc_ids) != hop_count:
             raise ValueError("MuSiQue GRPO gold_doc_ids must match hop_count")
+    elif hop_count == 1 and len(gold_doc_ids) < 1:
+        raise ValueError("Single-hop policy GRPO records require gold documents")
 
 
 def validate_knowledge_record(record: dict[str, Any]) -> None:

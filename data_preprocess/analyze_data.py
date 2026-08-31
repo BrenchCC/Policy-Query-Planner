@@ -199,6 +199,23 @@ def plot_training_mix(
     plt.title("Multi-hop SFT cold-start distribution")
     save_figure(figure_root / "cold_start_hop_distribution.png")
 
+    dpo_hop_counts = Counter(str(record["hop_count"]) for record in dpo_records)
+    dpo_hop_frame = pd.DataFrame(
+        {
+            "hop_count": sorted(dpo_hop_counts),
+            "records": [dpo_hop_counts[key] for key in sorted(dpo_hop_counts)]
+        }
+    )
+    sns.barplot(
+        data = dpo_hop_frame,
+        x = "hop_count",
+        y = "records",
+        hue = "hop_count",
+        legend = False
+    )
+    plt.title("DPO single-hop and multi-hop distribution")
+    save_figure(figure_root / "dpo_hop_distribution.png")
+
     grpo_hop_counts = Counter(str(record["hop_count"]) for record in grpo_records)
     hop_frame = pd.DataFrame(
         {
@@ -216,8 +233,11 @@ def plot_training_mix(
         "cold_start_hop_mix": dict(cold_start_hop_counts),
         "dpo_count": len(dpo_records),
         "dpo_mix": dict(Counter(record["source_dataset"] for record in dpo_records)),
+        "dpo_task_mix": dict(Counter(record["task_type"] for record in dpo_records)),
+        "dpo_hop_mix": dict(dpo_hop_counts),
         "dpo_error_mix": dict(Counter(record["error_type"] for record in dpo_records)),
         "grpo_count": len(grpo_records),
+        "grpo_task_mix": dict(Counter(record["task_type"] for record in grpo_records)),
         "grpo_hop_mix": dict(grpo_hop_counts)
     }
 
@@ -245,8 +265,9 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - SFT：{final_mix['sft_count']} 条，构成为 `{json.dumps(final_mix['sft_mix'], ensure_ascii = False)}`。
 - 多跳 SFT 冷启动：{final_mix['cold_start_count']} 条，hop 分布为 `{json.dumps(final_mix['cold_start_hop_mix'], ensure_ascii = False)}`。
 - DPO：{final_mix['dpo_count']} 条，来源为 `{json.dumps(final_mix['dpo_mix'], ensure_ascii = False)}`。
-- DPO 五类负样本严格均衡：`{json.dumps(final_mix['dpo_error_mix'], ensure_ascii = False)}`。
-- GRPO：{final_mix['grpo_count']} 条，hop 分布为 `{json.dumps(final_mix['grpo_hop_mix'], ensure_ascii = False)}`。
+- DPO 单跳/多跳构成为 `{json.dumps(final_mix['dpo_task_mix'], ensure_ascii = False)}`，hop 分布为 `{json.dumps(final_mix['dpo_hop_mix'], ensure_ascii = False)}`。
+- DPO 十类单因素困难负样本严格均衡：`{json.dumps(final_mix['dpo_error_mix'], ensure_ascii = False)}`。
+- GRPO：{final_mix['grpo_count']} 条，单跳/多跳构成为 `{json.dumps(final_mix['grpo_task_mix'], ensure_ascii = False)}`，hop 分布为 `{json.dumps(final_mix['grpo_hop_mix'], ensure_ascii = False)}`。
 
 ## 质量观察
 
@@ -254,7 +275,8 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - 政策原始语料包含21篇未被官方问题 split 引用的文档；它们保留在知识库中，用于模拟真实检索噪声。
 - 仅有1条 ConditionalQA heading-only evidence 未映射到正文 chunk，已记录在 `data/interim/gold_coverage_issues.json`。
 - QReCC no-op 样本被保留，用于抑制模型对本来已独立的问题进行过度改写。
-- 多跳 SFT 冷启动与 GRPO-ready 数据按来源 ID 和问题指纹严格隔离。
+- 多跳 SFT、DPO 与 GRPO-ready 数据按来源 ID 和问题指纹严格隔离。
+- DPO 与 GRPO 都保留单跳样本，用于抑制不必要拆分和奖励投机。
 - MuSiQue 使用单独 namespace，训练或评测时必须选择对应知识库。
 
 ## 图表
@@ -265,6 +287,7 @@ def write_markdown_report(summary: dict[str, Any]) -> None:
 - `figures/conditionalqa_evidence_counts.png`
 - `figures/training_stage_sizes.png`
 - `figures/cold_start_hop_distribution.png`
+- `figures/dpo_hop_distribution.png`
 - `figures/grpo_hop_distribution.png`
 """
     path = REPORT_ROOT / "eda_report.md"
