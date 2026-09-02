@@ -53,6 +53,40 @@ python embedding/build_embedding_store.py --namespace all
 
 每个 namespace 生成 `vectors.pth`、`index.faiss`、`metadata.jsonl` 和 `manifest.json`。`vectors.pth` 是按源 JSONL 顺序排列的 `float32` PyTorch Tensor；manifest 记录源文件 SHA256、模型配置、已完成条数、索引条数和 Token 用量。已有产物必须显式使用 `--resume` 续跑或使用 `--force` 重建。
 
+## Hybrid RAG
+
+混合检索先使用 BM25 和 Embedding 分别召回候选，再通过 RRF 合并排名。已有 FAISS 索引无需重建，只需为相同 namespace 补建一次 SQLite FTS5 BM25 索引：
+
+```bash
+python retrieval/bm25_store.py --namespace all
+```
+
+确保 `.env` 包含 `LLM_API_KEY`、`LLM_API_BASE_URL`、`QUERY_MODEL`、`RESPONSE_MODEL` 和上述 `EMBEDDING_*` 配置，然后执行单条 RAG 查询：
+
+```bash
+python retrieval/run_rag.py \
+  --namespace policy \
+  --query "Can I make a new Child Tax Credit claim?"
+```
+
+CLI 向 stdout 输出结构化 JSON，包括改写计划、RRF 证据、BM25/Embedding 排名、带 `[1]` 格式引用的答案和 Token 用量。Query 改写失败时自动回退原始问题；答案生成失败时仍保留已召回证据和错误信息。
+
+Python 接口支持直接执行已经解析的独立多查询计划：
+
+```python
+from retrieval import QueryPlan, QueryStep
+
+plan = QueryPlan(
+    queries = (
+        QueryStep(id = "q1", query = "Child Tax Credit eligibility"),
+        QueryStep(id = "q2", query = "Universal Credit alternative")
+    )
+)
+result = pipeline.run_plan("Which benefit can I claim?", plan)
+```
+
+`QueryStep.depends_on` 与 `{{qN.answer}}` 占位符协议也会保留；当前版本要求调用方先解析依赖，再交给 `run_plan`，后续可在此接口上增加逐跳执行器。
+
 ## Model-Assisted Generation
 
 先使用 dry-run 检查请求，不产生 API 费用：
