@@ -1,11 +1,21 @@
+import os
 import re
+import sys
 import json
 import logging
+import hashlib
 from typing import Any
 
 import jsonschema
 
+# Add project root to Python path / 将项目根目录加入 Python 路径
+sys.path.append(os.getcwd())
+
+from data_preprocess.common import normalize_text
+
 logger = logging.getLogger(__name__)
+
+EVAL_SCHEMA_VERSION = "1.0"
 
 PLANNER_PLAN_SCHEMA = {
     "type": "object",
@@ -33,6 +43,83 @@ PLANNER_PLAN_SCHEMA = {
         }
     }
 }
+
+RAG_EVAL_FIELDS = {
+    "id",
+    "input",
+    "system",
+    "scenario",
+    "metadata",
+    "question",
+    "source_id",
+    "answerable",
+    "namespace",
+    "instruction",
+    "answer_groups",
+    "gold_doc_ids",
+    "schema_version",
+    "gold_evidences",
+    "source_dataset",
+    "reference_answers",
+    "gold_evidence_doc_ids"
+}
+MULTIHOP_EVAL_FIELDS = {
+    "id",
+    "input",
+    "system",
+    "metadata",
+    "question",
+    "source_id",
+    "answerable",
+    "namespace",
+    "hop_count",
+    "instruction",
+    "gold_doc_ids",
+    "reference_plan",
+    "schema_version",
+    "reference_steps",
+    "source_dataset",
+    "reference_answers"
+}
+MULTIHOP_REFERENCE_STEP_FIELDS = {
+    "id",
+    "query",
+    "answer",
+    "depends_on",
+    "gold_doc_id",
+    "answer_aliases"
+}
+
+
+def evaluation_schema_hash() -> str:
+    """Hash the normalized evaluation and planner schema contracts.
+
+    Returns:
+        SHA256 digest of the public evaluation schema definition.
+    """
+    definition = {
+        "schema_version": EVAL_SCHEMA_VERSION,
+        "planner_plan_schema": PLANNER_PLAN_SCHEMA,
+        "rag": {
+            "fields": sorted(RAG_EVAL_FIELDS),
+            "source_dataset": "conditionalqa",
+            "namespace": "policy"
+        },
+        "multihop": {
+            "fields": sorted(MULTIHOP_EVAL_FIELDS),
+            "reference_step_fields": sorted(MULTIHOP_REFERENCE_STEP_FIELDS),
+            "hop_counts": [2, 3, 4],
+            "source_dataset": "musique",
+            "namespace": "musique_aux"
+        }
+    }
+    serialized = json.dumps(
+        definition,
+        ensure_ascii = False,
+        sort_keys = True,
+        separators = (",", ":")
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def serialize_plan(queries: list[dict[str, Any]]) -> str:
@@ -283,3 +370,173 @@ def validate_knowledge_record(record: dict[str, Any]) -> None:
     for field in required_fields:
         if not isinstance(record.get(field), str) or not record[field].strip():
             raise ValueError(f"Knowledge-base field {field} must be a non-empty string")
+
+
+def validate_eval_record_common(
+    record: dict[str, Any],
+    allowed_fields: set[str],
+    knowledge_doc_ids: set[str] | None = None
+) -> None:
+    """Validate fields shared by model-ready evaluation records.
+
+    Args:
+        record: Evaluation record to validate.
+        allowed_fields: Exact fields allowed by the dataset contract.
+        knowledge_doc_ids: Optional set of valid knowledge-base document IDs.
+
+    Raises:
+        ValueError: If fields, values, or Gold document references are invalid.
+    """
+    if set(record) != allowed_fields:
+        raise ValueError("Evaluation fields must exactly match the dataset contract")
+    string_fields = [
+        "id",
+        "input",
+        "system",
+        "question",
+        "source_id",
+        "namespace",
+        "instruction",
+        "source_dataset"
+    ]
+    for field in string_fields:
+        if not isinstance(record.get(field), str) or not record[field].strip():
+            raise ValueError(f"Evaluation field {field} must be a non-empty string")
+    if record.get("schema_version") != EVAL_SCHEMA_VERSION:
+        raise ValueError("Evaluation schema_version is unsupported")
+    if not isinstance(record.get("answerable"), bool):
+        raise ValueError("Evaluation answerable must be boolean")
+    reference_answers = record.get("reference_answers")
+    if not isinstance(reference_answers, list):
+        raise ValueError("Evaluation reference_answers must be a list")
+    if not all(isinstance(answer, str) and answer.strip() for answer in reference_answers):
+        raise ValueError("Evaluation reference_answers must contain non-empty strings")
+    if record["answerable"] and not reference_answers:
+        raise ValueError("Answerable evaluation records require reference answers")
+    gold_doc_ids = record.get("gold_doc_ids")
+    if not isinstance(gold_doc_ids, list):
+        raise ValueError("Evaluation gold_doc_ids must be a list")
+    if (
+        not all(isinstance(doc_id, str) and doc_id.strip() for doc_id in gold_doc_ids)
+        or len(gold_doc_ids) != len(set(gold_doc_ids))
+    ):
+        raise ValueError("Evaluation gold_doc_ids must be unique non-empty strings")
+    if not isinstance(record.get("metadata"), dict):
+        raise ValueError("Evaluation metadata must be an object")
+    if knowledge_doc_ids is not None:
+        missing_doc_ids = set(gold_doc_ids) - knowledge_doc_ids
+        if missing_doc_ids:
+            raise ValueError(f"Gold documents are missing from the knowledge base: {missing_doc_ids}")
+
+
+def validate_rag_eval_record(
+    record: dict[str, Any],
+    knowledge_doc_ids: set[str] | None = None
+) -> None:
+    """Validate one model-ready policy RAG evaluation record.
+
+    Args:
+        record: Policy RAG evaluation record.
+        knowledge_doc_ids: Optional set of valid policy document IDs.
+
+    Raises:
+        ValueError: If schema or evidence alignment is invalid.
+    """
+    validate_eval_record_common(record, RAG_EVAL_FIELDS, knowledge_doc_ids)
+    if record["source_dataset"] != "conditionalqa" or record["namespace"] != "policy":
+        raise ValueError("Policy RAG evaluation provenance is invalid")
+    if not isinstance(record.get("scenario"), str):
+        raise ValueError("Policy RAG scenario must be a string")
+    answer_groups = record.get("answer_groups")
+    if not isinstance(answer_groups, list):
+        raise ValueError("Policy RAG answer_groups must be a list")
+    for answer_group in answer_groups:
+        if (
+            not isinstance(answer_group, list)
+            or len(answer_group) != 2
+            or not isinstance(answer_group[0], str)
+            or not answer_group[0].strip()
+            or not isinstance(answer_group[1], list)
+            or not all(
+                isinstance(condition, str) and condition.strip()
+                for condition in answer_group[1]
+            )
+        ):
+            raise ValueError("Policy RAG answer_groups contain an invalid answer annotation")
+    gold_evidences = record.get("gold_evidences")
+    evidence_doc_ids = record.get("gold_evidence_doc_ids")
+    if not isinstance(gold_evidences, list) or not isinstance(evidence_doc_ids, list):
+        raise ValueError("Policy RAG evidence fields must be lists")
+    if len(gold_evidences) != len(evidence_doc_ids):
+        raise ValueError("Policy RAG evidence and document mappings must align")
+    if not all(isinstance(value, str) and value.strip() for value in gold_evidences):
+        raise ValueError("Policy RAG evidences must be non-empty strings")
+    if not all(isinstance(value, str) and value.strip() for value in evidence_doc_ids):
+        raise ValueError("Policy RAG evidence document IDs must be non-empty strings")
+    if set(evidence_doc_ids) != set(record["gold_doc_ids"]):
+        raise ValueError("Policy RAG aggregate and per-evidence Gold documents must match")
+    primary_answers = list(dict.fromkeys(normalize_text(group[0]) for group in answer_groups))
+    if primary_answers != record["reference_answers"]:
+        raise ValueError("Policy RAG reference answers must match answer_groups")
+    if record["answerable"] and (not answer_groups or not gold_evidences):
+        raise ValueError("Answerable policy RAG records require answers and evidence")
+    if not record["answerable"] and (
+        answer_groups
+        or gold_evidences
+        or evidence_doc_ids
+        or record["reference_answers"]
+        or record["gold_doc_ids"]
+    ):
+        raise ValueError("Unanswerable policy RAG records cannot contain Gold annotations")
+    if knowledge_doc_ids is not None and not set(evidence_doc_ids).issubset(knowledge_doc_ids):
+        raise ValueError("Policy RAG evidence references a missing knowledge document")
+
+
+def validate_multihop_eval_record(
+    record: dict[str, Any],
+    knowledge_doc_ids: set[str] | None = None
+) -> None:
+    """Validate one model-ready multi-hop planner evaluation record.
+
+    Args:
+        record: Multi-hop planner evaluation record.
+        knowledge_doc_ids: Optional set of valid MuSiQue document IDs.
+
+    Raises:
+        ValueError: If plan, steps, or Gold annotations are inconsistent.
+    """
+    validate_eval_record_common(record, MULTIHOP_EVAL_FIELDS, knowledge_doc_ids)
+    if record["source_dataset"] != "musique" or record["namespace"] != "musique_aux":
+        raise ValueError("Multi-hop evaluation provenance is invalid")
+    if not record["answerable"]:
+        raise ValueError("MuSiQue multi-hop evaluation records must be answerable")
+    hop_count = record.get("hop_count")
+    if hop_count not in {2, 3, 4}:
+        raise ValueError("Multi-hop evaluation hop_count must be 2, 3, or 4")
+    plan = validate_planner_plan(record.get("reference_plan"))
+    steps = record.get("reference_steps")
+    if not isinstance(steps, list) or len(steps) != hop_count:
+        raise ValueError("Multi-hop reference_steps must match hop_count")
+    if len(plan["queries"]) != hop_count:
+        raise ValueError("Multi-hop reference plan must match hop_count")
+    for plan_query, step in zip(plan["queries"], steps):
+        if not isinstance(step, dict) or set(step) != MULTIHOP_REFERENCE_STEP_FIELDS:
+            raise ValueError("Multi-hop reference step fields are invalid")
+        if any(step.get(field) != plan_query[field] for field in ["id", "query", "depends_on"]):
+            raise ValueError("Multi-hop reference step does not align with reference plan")
+        if not isinstance(step.get("answer"), str) or not step["answer"].strip():
+            raise ValueError("Multi-hop step answer must be non-empty")
+        if not isinstance(step.get("answer_aliases"), list):
+            raise ValueError("Multi-hop step answer_aliases must be a list")
+        if not all(isinstance(alias, str) and alias.strip() for alias in step["answer_aliases"]):
+            raise ValueError("Multi-hop step aliases must be non-empty strings")
+        if not isinstance(step.get("gold_doc_id"), str) or not step["gold_doc_id"].strip():
+            raise ValueError("Multi-hop step gold_doc_id must be non-empty")
+    step_doc_ids = [step["gold_doc_id"] for step in steps]
+    if step_doc_ids != record["gold_doc_ids"]:
+        raise ValueError("Multi-hop step documents must align with gold_doc_ids")
+    final_references = list(
+        dict.fromkeys([steps[-1]["answer"], *steps[-1]["answer_aliases"]])
+    )
+    if final_references != record["reference_answers"]:
+        raise ValueError("Multi-hop final references must match the final step")

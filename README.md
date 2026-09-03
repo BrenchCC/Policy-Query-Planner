@@ -12,8 +12,12 @@ API 配置只通过环境变量读取，不要将密钥写入代码：
 
 ```bash
 export LLM_API_KEY="your-key"
-export LLM_API_BASE_URL="your-base-url"
-export LLM_ENDPOINT="your-endpoint"
+export LLM_BASE_URL="your-base-url"
+export LLM_ENDPOINT="your-generation-endpoint"
+export QUERY_MODEL="your-planner-model"
+export RESPONSE_MODEL="your-answer-model"
+export JUDGE_MODEL_1="your-first-judge-model"
+export JUDGE_MODEL_2="your-second-judge-model"
 export EMBEDDING_API_KEY="your-embedding-key"
 export EMBEDDING_BASE_URL="https://your-workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 export EMBEDDING_MODEL="qwen3.7-text-embedding"
@@ -61,7 +65,7 @@ python embedding/build_embedding_store.py --namespace all
 python retrieval/bm25_store.py --namespace all
 ```
 
-确保 `.env` 包含 `LLM_API_KEY`、`LLM_API_BASE_URL`、`QUERY_MODEL`、`RESPONSE_MODEL` 和上述 `EMBEDDING_*` 配置，然后执行单条 RAG 查询：
+确保 `.env` 包含 `LLM_API_KEY`、`LLM_BASE_URL`、`QUERY_MODEL`、`RESPONSE_MODEL` 和上述 `EMBEDDING_*` 配置，然后执行单条 RAG 查询：
 
 ```bash
 python retrieval/run_rag.py \
@@ -85,7 +89,50 @@ plan = QueryPlan(
 result = pipeline.run_plan("Which benefit can I claim?", plan)
 ```
 
-`QueryStep.depends_on` 与 `{{qN.answer}}` 占位符协议也会保留；当前版本要求调用方先解析依赖，再交给 `run_plan`，后续可在此接口上增加逐跳执行器。
+`QueryStep.depends_on` 与 `{{qN.answer}}` 占位符协议也会保留。批量评测使用 `evaluation.runtime.ChainExecutor` 逐跳完成检索、中间答案生成和依赖替换；`run_plan` 仍只接收已经解析依赖的 Query。
+
+## Evaluation
+
+数据构建命令会在保留官方 benchmark 文件的同时生成两套模型就绪评测集及 `eval_manifest.json`：
+
+- `rag_policy_eval.jsonl`：285 条 ConditionalQA Dev，用于政策 RAG 检索、回答与拒答评测。
+- `multihop_planner_eval.jsonl`：2,417 条 MuSiQue Dev，用于 2/3/4-hop 查询计划和真实逐跳执行评测。
+
+先按检查点生成预测。下面以小规模烟测为例；移除 `--limit` 后执行完整评测：
+
+```bash
+python evaluation/run_predictions.py \
+  --dataset data/processed/eval/rag_policy_eval.jsonl \
+  --planner-model "$QUERY_MODEL" \
+  --output data/evaluation_runs/rag_policy/predictions.jsonl \
+  --limit 10 \
+  --force
+
+python evaluation/run_predictions.py \
+  --dataset data/processed/eval/multihop_planner_eval.jsonl \
+  --planner-model "$QUERY_MODEL" \
+  --output data/evaluation_runs/multihop_planner/predictions.jsonl \
+  --limit 10 \
+  --force
+```
+
+预测文件可重复离线评分。默认使用两个不同的 `JUDGE_MODEL_1` 和 `JUDGE_MODEL_2` 各投 3 票，并将 Judge 缓存写入报告目录；完整评分最多产生每样本 6 次 Judge 请求，建议先用 `--limit` 烟测成本。增加 `--skip-judge` 可只计算确定性指标：
+
+```bash
+python evaluation/score_predictions.py \
+  --dataset data/processed/eval/rag_policy_eval.jsonl \
+  --predictions data/evaluation_runs/rag_policy/predictions.jsonl \
+  --output-dir data/evaluation_runs/rag_policy/report \
+  --limit 10
+
+python evaluation/score_predictions.py \
+  --dataset data/processed/eval/multihop_planner_eval.jsonl \
+  --predictions data/evaluation_runs/multihop_planner/predictions.jsonl \
+  --output-dir data/evaluation_runs/multihop_planner/report \
+  --limit 10
+```
+
+每个报告目录包含逐样本 `scores.jsonl`、汇总 `summary.json`、可读的 `report.md` 和可断点复用的 `judge_cache.jsonl`。预测 sidecar manifest 固定数据哈希、模型和检索参数；兼容续跑必须使用 `--resume`，参数变化后需要显式 `--force`。
 
 ## Model-Assisted Generation
 
@@ -125,6 +172,9 @@ python data_preprocess/validate_datasets.py --stage train
 - `data/processed/eval/conditionalqa_test_blind.jsonl`：官方无答案测试集。
 - `data/processed/eval/qrecc_test.jsonl`：官方 Query Rewrite 测试集。
 - `data/processed/eval/musique_dev.jsonl`：官方多跳开发集。
+- `data/processed/eval/rag_policy_eval.jsonl`：模型就绪的 ConditionalQA RAG 评测集。
+- `data/processed/eval/multihop_planner_eval.jsonl`：模型就绪的 MuSiQue 多跳 Planner 评测集。
+- `data/processed/eval/eval_manifest.json`：评测集版本、数量、分层分布与 SHA256。
 - `data/processed/train/sft_train.jsonl`：20,000 条单跳 Alpaca SFT 基础数据。
 - `data/processed/train/sft_multihop_cold_start.jsonl`：2,000 条 MuSiQue 多跳 SFT 冷启动数据，其中 2/3/4-hop 分别为 1,000/600/400 条。
 - `data/processed/train/dpo_train.jsonl`：5,000 条 preference 数据；2,500 条单跳、2,500 条多跳，1/2/3/4-hop 分别为 2,500/1,250/1,000/250。

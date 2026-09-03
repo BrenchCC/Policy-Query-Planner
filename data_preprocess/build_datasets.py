@@ -19,9 +19,11 @@ from data_preprocess.common import (
     read_jsonl,
     write_json,
     write_jsonl,
+    sha256_file,
     normalize_text,
     normalized_key
 )
+from data_preprocess.clean_data import best_evidence_chunk
 from data_preprocess.config import (
     INTERIM_ROOT,
     PROCESSED_ROOT,
@@ -36,10 +38,14 @@ from data_preprocess.config import (
 )
 from data_preprocess.prompts import PLANNER_SYSTEM_PROMPT
 from data_preprocess.schemas import (
+    EVAL_SCHEMA_VERSION,
+    evaluation_schema_hash,
     serialize_plan,
     validate_sft_record,
     validate_dpo_record,
+    validate_rag_eval_record,
     validate_multihop_sft_record,
+    validate_multihop_eval_record,
     validate_grpo_record
 )
 
@@ -899,7 +905,197 @@ def export_evaluation_sets() -> dict[str, int]:
         records = read_jsonl(source_path)
         write_jsonl(PROCESSED_ROOT / "eval" / file_name, records)
         counts[file_name] = len(records)
+
+    policy_documents = read_jsonl(PROCESSED_ROOT / "knowledge_base" / "policy.jsonl")
+    policy_documents_by_url: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for document in policy_documents:
+        policy_documents_by_url[document["url"]].append(document)
+    rag_records = build_rag_eval_records(
+        read_jsonl(INTERIM_ROOT / "conditionalqa_dev.jsonl"),
+        policy_documents_by_url
+    )
+    musique_documents = read_jsonl(
+        PROCESSED_ROOT / "knowledge_base" / "musique_aux.jsonl"
+    )
+    multihop_records = build_multihop_eval_records(
+        read_jsonl(INTERIM_ROOT / "musique_dev.jsonl")
+    )
+    rag_path = PROCESSED_ROOT / "eval" / "rag_policy_eval.jsonl"
+    multihop_path = PROCESSED_ROOT / "eval" / "multihop_planner_eval.jsonl"
+    write_jsonl(rag_path, rag_records)
+    write_jsonl(multihop_path, multihop_records)
+    counts[rag_path.name] = len(rag_records)
+    counts[multihop_path.name] = len(multihop_records)
+
+    policy_doc_ids = {document["id"] for document in policy_documents}
+    musique_doc_ids = {document["id"] for document in musique_documents}
+    for record in rag_records:
+        validate_rag_eval_record(record, policy_doc_ids)
+    for record in multihop_records:
+        validate_multihop_eval_record(record, musique_doc_ids)
+    schema_hash = evaluation_schema_hash()
+    manifest = {
+        "schema_version": EVAL_SCHEMA_VERSION,
+        "schema_hash": schema_hash,
+        "datasets": {
+            "rag_policy_eval": {
+                "file_name": rag_path.name,
+                "source_file": "conditionalqa_dev.jsonl",
+                "source_dataset": "conditionalqa",
+                "namespace": "policy",
+                "count": len(rag_records),
+                "sha256": sha256_file(rag_path)
+            },
+            "multihop_planner_eval": {
+                "file_name": multihop_path.name,
+                "source_file": "musique_dev.jsonl",
+                "source_dataset": "musique",
+                "namespace": "musique_aux",
+                "count": len(multihop_records),
+                "hop_counts": dict(
+                    Counter(str(record["hop_count"]) for record in multihop_records)
+                ),
+                "sha256": sha256_file(multihop_path)
+            }
+        }
+    }
+    write_json(PROCESSED_ROOT / "eval" / "eval_manifest.json", manifest)
     return counts
+
+
+def extract_reference_answers(answer_groups: list[Any]) -> list[str]:
+    """Extract unique primary answers without flattening conditional answer groups.
+
+    Args:
+        answer_groups: Original ConditionalQA nested answer annotations.
+
+    Returns:
+        Ordered, normalized primary reference answers.
+    """
+    answers = []
+    for group in answer_groups:
+        if not isinstance(group, list) or not group:
+            continue
+        answer = normalize_text(str(group[0]))
+        if answer and answer not in answers:
+            answers.append(answer)
+    return answers
+
+
+def build_rag_eval_records(
+    records: list[dict[str, Any]],
+    documents_by_url: dict[str, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """Build model-ready policy RAG evaluation records.
+
+    Args:
+        records: Clean ConditionalQA development records.
+        documents_by_url: Policy knowledge chunks grouped by source URL.
+
+    Returns:
+        Strict policy RAG evaluation records.
+
+    Raises:
+        ValueError: If an evidence cannot be aligned to a knowledge chunk.
+    """
+    eval_records = []
+    for record in records:
+        evidence_doc_ids = []
+        for evidence in record["evidences"]:
+            doc_id, _ = best_evidence_chunk(evidence, documents_by_url.get(record["url"], []))
+            if doc_id is None:
+                raise ValueError(f"Unable to map evaluation evidence: {record['id']}")
+            evidence_doc_ids.append(doc_id)
+        gold_doc_ids = list(dict.fromkeys(evidence_doc_ids))
+        if gold_doc_ids != record["gold_doc_ids"]:
+            raise ValueError(f"Evaluation evidence mapping changed: {record['id']}")
+        eval_record = {
+            "schema_version": EVAL_SCHEMA_VERSION,
+            "id": "rag_policy_" + record["id"],
+            "source_dataset": "conditionalqa",
+            "source_id": record["id"],
+            "namespace": "policy",
+            "system": PLANNER_SYSTEM_PROMPT,
+            "instruction": GRPO_INSTRUCTION,
+            "input": f"Scenario:\n{record['scenario']}\n\nQuestion:\n{record['question']}",
+            "question": record["question"],
+            "reference_answers": extract_reference_answers(record["answers"]),
+            "gold_doc_ids": gold_doc_ids,
+            "answerable": not record["not_answerable"],
+            "metadata": {
+                "split": record["split"],
+                "title": record["title"],
+                "url": record["url"]
+            },
+            "scenario": record["scenario"],
+            "gold_evidences": record["evidences"],
+            "gold_evidence_doc_ids": evidence_doc_ids,
+            "answer_groups": record["answers"]
+        }
+        validate_rag_eval_record(eval_record)
+        eval_records.append(eval_record)
+    return eval_records
+
+
+def build_multihop_eval_records(
+    records: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Build model-ready multi-hop planner evaluation records.
+
+    Args:
+        records: Clean MuSiQue development records.
+
+    Returns:
+        Strict dependency-aware multi-hop evaluation records.
+    """
+    eval_records = []
+    for record in records:
+        reference_plan = json.loads(convert_musique_plan(record))
+        reference_steps = []
+        for step_index, (plan_query, source_step) in enumerate(zip(
+            reference_plan["queries"],
+            record["question_decomposition"]
+        )):
+            answer_aliases = (
+                record.get("answer_aliases", [])
+                if step_index == record["hop_count"] - 1
+                else []
+            )
+            reference_steps.append(
+                {
+                    **plan_query,
+                    "answer": source_step["answer"],
+                    "answer_aliases": answer_aliases,
+                    "gold_doc_id": source_step["gold_doc_id"]
+                }
+            )
+        reference_answers = list(
+            dict.fromkeys([record["answer"], *record.get("answer_aliases", [])])
+        )
+        eval_record = {
+            "schema_version": EVAL_SCHEMA_VERSION,
+            "id": "multihop_planner_" + record["id"],
+            "source_dataset": "musique",
+            "source_id": record["id"],
+            "namespace": "musique_aux",
+            "system": PLANNER_SYSTEM_PROMPT,
+            "instruction": GRPO_INSTRUCTION,
+            "input": f"Question:\n{record['question']}",
+            "question": record["question"],
+            "reference_answers": reference_answers,
+            "gold_doc_ids": record["gold_doc_ids"],
+            "answerable": record["answerable"],
+            "metadata": {
+                "split": record["split"],
+                "paragraph_doc_ids": record["paragraph_doc_ids"]
+            },
+            "hop_count": record["hop_count"],
+            "reference_plan": reference_plan,
+            "reference_steps": reference_steps
+        }
+        validate_multihop_eval_record(eval_record)
+        eval_records.append(eval_record)
+    return eval_records
 
 
 def write_dataset_info() -> None:

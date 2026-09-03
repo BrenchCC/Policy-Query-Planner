@@ -36,9 +36,13 @@ from data_preprocess.config import (
     EVIDENCE_MAPPING_THRESHOLD
 )
 from data_preprocess.schemas import (
+    EVAL_SCHEMA_VERSION,
+    evaluation_schema_hash,
     validate_sft_record,
     validate_dpo_record,
+    validate_rag_eval_record,
     validate_multihop_sft_record,
+    validate_multihop_eval_record,
     validate_grpo_record,
     validate_knowledge_record
 )
@@ -126,7 +130,63 @@ def validate_base() -> None:
         if len(records) != expected_count:
             raise ValueError(f"Unexpected benchmark count for {file_name}")
         assert_unique_ids(records, file_name)
+
+    policy_doc_ids = {
+        record["id"]
+        for record in read_jsonl(PROCESSED_ROOT / "knowledge_base" / "policy.jsonl")
+    }
+    musique_doc_ids = {
+        record["id"]
+        for record in read_jsonl(PROCESSED_ROOT / "knowledge_base" / "musique_aux.jsonl")
+    }
+    rag_records = validate_records(
+        PROCESSED_ROOT / "eval" / "rag_policy_eval.jsonl",
+        285,
+        lambda record: validate_rag_eval_record(record, policy_doc_ids)
+    )
+    multihop_records = validate_records(
+        PROCESSED_ROOT / "eval" / "multihop_planner_eval.jsonl",
+        2417,
+        lambda record: validate_multihop_eval_record(record, musique_doc_ids)
+    )
+    hop_counts = Counter(record["hop_count"] for record in multihop_records)
+    if hop_counts != {2: 1252, 3: 760, 4: 405}:
+        raise ValueError(f"Unexpected evaluation hop distribution: {hop_counts}")
+    if len(rag_records) != len({record["source_id"] for record in rag_records}):
+        raise ValueError("Duplicate ConditionalQA source IDs in policy RAG evaluation")
+    if len(multihop_records) != len(
+        {record["source_id"] for record in multihop_records}
+    ):
+        raise ValueError("Duplicate MuSiQue source IDs in multi-hop evaluation")
+    validate_eval_manifest()
     logger.info("Knowledge-base and benchmark validation passed")
+
+
+def validate_eval_manifest() -> None:
+    """Validate model-ready evaluation manifest counts and checksums.
+
+    Raises:
+        ValueError: If manifest metadata differs from the generated artifacts.
+    """
+    manifest = read_json(PROCESSED_ROOT / "eval" / "eval_manifest.json")
+    if manifest.get("schema_version") != EVAL_SCHEMA_VERSION:
+        raise ValueError("Evaluation manifest schema version is invalid")
+    expected_schema_hash = evaluation_schema_hash()
+    if manifest.get("schema_hash") != expected_schema_hash:
+        raise ValueError("Evaluation manifest schema hash is invalid")
+    expected_datasets = {
+        "rag_policy_eval": 285,
+        "multihop_planner_eval": 2417
+    }
+    if set(manifest.get("datasets", {})) != set(expected_datasets):
+        raise ValueError("Evaluation manifest datasets are invalid")
+    for dataset_name, expected_count in expected_datasets.items():
+        entry = manifest["datasets"][dataset_name]
+        path = PROCESSED_ROOT / "eval" / entry["file_name"]
+        if entry.get("count") != expected_count:
+            raise ValueError(f"Evaluation manifest count is invalid: {dataset_name}")
+        if entry.get("sha256") != sha256_file(path):
+            raise ValueError(f"Evaluation manifest checksum is invalid: {dataset_name}")
 
 
 def validate_records(

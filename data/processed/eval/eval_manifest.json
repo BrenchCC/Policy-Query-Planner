@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "schema_hash": "0f205e71c398dfe15313084addc26aab6a0e055bae1cd6554437ce026dedc54c",
+  "datasets": {
+    "rag_policy_eval": {
+      "file_name": "rag_policy_eval.jsonl",
+      "source_file": "conditionalqa_dev.jsonl",
+      "source_dataset": "conditionalqa",
+      "namespace": "policy",
+      "count": 285,
+      "sha256": "23419672986cdefe5ab9c1c1b65c973e9a8512ca5ee51b9eca60abfb11628e8d"
+    },
+    "multihop_planner_eval": {
+      "file_name": "multihop_planner_eval.jsonl",
+      "source_file": "musique_dev.jsonl",
+      "source_dataset": "musique",
+      "namespace": "musique_aux",
+      "count": 2417,
+      "hop_counts": {
+        "2": 1252,
+        "3": 760,
+        "4": 405
+      },
+      "sha256": "25f3a27e8116a46f6c784e29391014b4490cece7a1e11512cc91a5770db8902a"
+    }
+  }
+}

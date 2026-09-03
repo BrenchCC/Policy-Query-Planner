@@ -28,6 +28,7 @@ MANIFEST
 .DS_Store
 .vscode
 logs/
+data/evaluation_runs/
 .obsidian
 # PyInstaller
 #  Usually these files are written by a python script from a template

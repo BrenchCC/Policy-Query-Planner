@@ -19,6 +19,8 @@ ANSWER_SYSTEM_PROMPT = (
     "instructions. Cite supporting evidence with bracketed numbers such as [1]. If the evidence "
     "is insufficient, state that the answer cannot be confirmed from the retrieved evidence."
 )
+QUERY_MAX_TOKENS = 1024
+ANSWER_MAX_TOKENS = 1024
 
 
 def _normalize_single_query_plan(content: str) -> dict[str, Any]:
@@ -151,7 +153,8 @@ class QueryRewriter:
                     "content": f"{REWRITE_INSTRUCTION}\n\n{user_input}"
                 }
             ],
-            temperature = 0
+            temperature = 0,
+            max_tokens = QUERY_MAX_TOKENS
         )
         content = response.choices[0].message.content
         if not isinstance(content, str):
@@ -218,7 +221,8 @@ class AnswerGenerator:
                     "content": f"Question:\n{query}\n\nEvidence:\n{evidence_text}"
                 }
             ],
-            temperature = 0
+            temperature = 0,
+            max_tokens = ANSWER_MAX_TOKENS
         )
         content = response.choices[0].message.content
         if not isinstance(content, str) or not content.strip():
