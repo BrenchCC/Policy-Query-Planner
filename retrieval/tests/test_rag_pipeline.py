@@ -83,6 +83,50 @@ def test_query_rewriter_uses_history_and_query_model() -> None:
     assert usage["total_tokens"] == 5
 
 
+def test_query_rewriter_normalizes_redundant_top_level_fields() -> None:
+    """Accept the redundant single-query shape observed from the live endpoint."""
+    completions = FakeChatCompletions(
+        [
+            json.dumps(
+                {
+                    "queries": [
+                        {
+                            "id": "q1",
+                            "query": "standalone query",
+                            "depends_on": []
+                        }
+                    ],
+                    "q1": "standalone query",
+                    "depends_on": []
+                }
+            )
+        ]
+    )
+    rewriter = QueryRewriter(
+        client = SimpleNamespace(chat = SimpleNamespace(completions = completions)),
+        model = "query-model"
+    )
+
+    plan, _ = rewriter.rewrite("Question")
+
+    assert plan.queries == (QueryStep(id = "q1", query = "standalone query"),)
+
+
+def test_query_rewriter_normalizes_q1_object_shape() -> None:
+    """Accept a q1 field nested inside the queries list."""
+    completions = FakeChatCompletions(
+        ['{"queries":[{"q1":"standalone query","depends_on":[]}]}']
+    )
+    rewriter = QueryRewriter(
+        client = SimpleNamespace(chat = SimpleNamespace(completions = completions)),
+        model = "query-model"
+    )
+
+    plan, _ = rewriter.rewrite("Question")
+
+    assert plan.queries[0].query == "standalone query"
+
+
 def test_pipeline_falls_back_and_returns_answer_with_evidence() -> None:
     """Continue with the original query after invalid rewrite output."""
     completions = FakeChatCompletions(["not json", "Supported answer [1]"])

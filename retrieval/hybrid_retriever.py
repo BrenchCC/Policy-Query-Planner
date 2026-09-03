@@ -1,15 +1,78 @@
 import re
 import json
+import time
 import sqlite3
+import logging
 from pathlib import Path
 from typing import Any
 
 import faiss
 import numpy as np
+from tqdm import tqdm
 
 from data_preprocess.common import read_jsonl, sha256_file
-from embedding.embedding_store import embed_texts
 from retrieval.models import QueryStep, RetrievalHit
+
+logger = logging.getLogger(__name__)
+
+
+def _embed_query(
+    client: Any,
+    query: str,
+    model: str,
+    dimensions: int,
+    max_retries: int = 2
+) -> np.ndarray:
+    """Embed and normalize one query without importing PyTorch.
+
+    Args:
+        client: OpenAI-compatible client.
+        query: Query text sent to the embedding endpoint.
+        model: Embedding model name.
+        dimensions: Required dense vector dimension.
+        max_retries: Number of retries after the initial request.
+
+    Returns:
+        One ordered unit-length float32 query vector.
+    """
+    response = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = client.embeddings.create(
+                model = model,
+                input = [query],
+                dimensions = dimensions,
+                encoding_format = "float"
+            )
+            break
+        except Exception:
+            if attempt >= max_retries:
+                raise
+            delay = float(2 ** attempt)
+            logger.warning(
+                "Embedding request failed; retrying attempt=%d/%d delay=%.1fs",
+                attempt + 1,
+                max_retries,
+                delay
+            )
+            time.sleep(delay)
+    if response is None:
+        raise RuntimeError("Embedding request completed without a response")
+    rows = sorted(response.data, key = lambda item: item.index)
+    if [item.index for item in rows] != [0]:
+        raise ValueError("Embedding response index does not match the query")
+    vector = np.asarray([rows[0].embedding], dtype = np.float32)
+    if vector.shape != (1, dimensions):
+        raise ValueError(
+            f"Embedding response shape {vector.shape} does not match (1, {dimensions})"
+        )
+    if not np.isfinite(vector).all():
+        raise ValueError("Embedding response contains non-finite values")
+    norm = np.linalg.norm(vector, axis = 1, keepdims = True)
+    if np.any(norm == 0):
+        raise ValueError("Embedding response contains a zero vector")
+    vector /= norm
+    return vector
 
 
 def _fts_query(query: str) -> str:
@@ -67,7 +130,8 @@ class HybridRetriever:
         namespace_root: Path,
         embedding_client: Any,
         candidate_k: int = 50,
-        rrf_k: int = 60
+        rrf_k: int = 60,
+        show_progress: bool = False
     ) -> None:
         """Load and validate retrieval artifacts.
 
@@ -76,6 +140,7 @@ class HybridRetriever:
             embedding_client: OpenAI-compatible client with embeddings.create.
             candidate_k: Default candidates retrieved from each channel.
             rrf_k: Reciprocal-rank-fusion offset.
+            show_progress: Whether to display retrieval progress on stderr.
         """
         if candidate_k < 1:
             raise ValueError("candidate_k must be at least 1")
@@ -83,6 +148,7 @@ class HybridRetriever:
         self.embedding_client = embedding_client
         self.candidate_k = candidate_k
         self.rrf_k = rrf_k
+        self.show_progress = show_progress
         self.metadata_path = namespace_root / "metadata.jsonl"
         self.database_path = namespace_root / "bm25.sqlite3"
         self.records = read_jsonl(self.metadata_path)
@@ -127,9 +193,9 @@ class HybridRetriever:
 
     def _search_embedding(self, query: str, candidate_k: int) -> list[tuple[int, float]]:
         """Embed and search one query against the FAISS index."""
-        vectors, _ = embed_texts(
+        vectors = _embed_query(
             client = self.embedding_client,
-            texts = [query],
+            query = query,
             model = self.vector_manifest["model"],
             dimensions = int(self.vector_manifest["dimensions"]),
             max_retries = 2
@@ -188,28 +254,44 @@ class HybridRetriever:
             raise ValueError("candidate_k must be at least 1")
         rankings = []
         channel_details: dict[int, dict[str, Any]] = {}
-        for step in queries:
-            if step.depends_on:
-                raise ValueError(
-                    f"Query {step.id} still has unresolved dependencies: {step.depends_on}"
-                )
-            bm25_results = self._search_bm25(step.query, selected_candidate_k)
-            embedding_results = self._search_embedding(step.query, selected_candidate_k)
-            rankings.extend([bm25_results, embedding_results])
-            for channel, results in (
-                ("bm25", bm25_results),
-                ("embedding", embedding_results)
-            ):
-                for rank, (document_index, score) in enumerate(results, start = 1):
-                    details = channel_details.setdefault(document_index, {"query_ids": []})
-                    if step.id not in details["query_ids"]:
-                        details["query_ids"].append(step.id)
-                    rank_key = f"{channel}_rank"
-                    score_key = f"{channel}_score"
-                    if rank_key not in details or rank < details[rank_key]:
-                        details[rank_key] = rank
-                        details[score_key] = score
-        fused = reciprocal_rank_fusion(rankings, rrf_k = self.rrf_k)
+        with tqdm(
+            total = len(queries) * 2 + 1,
+            desc = "Hybrid retrieval",
+            unit = "stage",
+            dynamic_ncols = True,
+            disable = not self.show_progress
+        ) as progress:
+            for step in queries:
+                if step.depends_on:
+                    raise ValueError(
+                        f"Query {step.id} still has unresolved dependencies: {step.depends_on}"
+                    )
+                progress.set_postfix_str(f"{step.id}: BM25")
+                bm25_results = self._search_bm25(step.query, selected_candidate_k)
+                progress.update(1)
+                progress.set_postfix_str(f"{step.id}: Embedding")
+                embedding_results = self._search_embedding(step.query, selected_candidate_k)
+                progress.update(1)
+                rankings.extend([bm25_results, embedding_results])
+                for channel, results in (
+                    ("bm25", bm25_results),
+                    ("embedding", embedding_results)
+                ):
+                    for rank, (document_index, score) in enumerate(results, start = 1):
+                        details = channel_details.setdefault(
+                            document_index,
+                            {"query_ids": []}
+                        )
+                        if step.id not in details["query_ids"]:
+                            details["query_ids"].append(step.id)
+                        rank_key = f"{channel}_rank"
+                        score_key = f"{channel}_score"
+                        if rank_key not in details or rank < details[rank_key]:
+                            details[rank_key] = rank
+                            details[score_key] = score
+            progress.set_postfix_str("RRF fusion")
+            fused = reciprocal_rank_fusion(rankings, rrf_k = self.rrf_k)
+            progress.update(1)
         hits = []
         for document_index, rrf_score in fused[:top_k]:
             details = channel_details[document_index]

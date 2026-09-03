@@ -69,7 +69,7 @@ python retrieval/run_rag.py \
   --query "Can I make a new Child Tax Credit claim?"
 ```
 
-CLI 向 stdout 输出结构化 JSON，包括改写计划、RRF 证据、BM25/Embedding 排名、带 `[1]` 格式引用的答案和 Token 用量。Query 改写失败时自动回退原始问题；答案生成失败时仍保留已召回证据和错误信息。
+CLI 使用 `tqdm` 在 stderr 展示 BM25、Embedding 与 RRF 融合进度，并向 stdout 输出结构化 JSON，包括改写计划、RRF 证据、BM25/Embedding 排名、带 `[1]` 格式引用的答案和 Token 用量。Query 改写失败时自动回退原始问题；答案生成失败时仍保留已召回证据和错误信息。Python 接口默认不显示进度，可在构造 `HybridRetriever` 时设置 `show_progress = True`。
 
 Python 接口支持直接执行已经解析的独立多查询计划：
 

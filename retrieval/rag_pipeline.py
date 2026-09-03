@@ -21,6 +21,72 @@ ANSWER_SYSTEM_PROMPT = (
 )
 
 
+def _normalize_single_query_plan(content: str) -> dict[str, Any]:
+    """Normalize common single-query JSON shapes emitted by chat models.
+
+    Args:
+        content: Raw query-model response.
+
+    Returns:
+        Canonical planner dictionary accepted by validate_planner_plan.
+
+    Raises:
+        ValueError: If the response cannot be normalized safely.
+    """
+    stripped = content.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3:
+            stripped = "\n".join(lines[1:-1]).strip()
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"Invalid planner JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError("Planner response must be a JSON object")
+
+    allowed_fields = {"queries", "query", "id", "q1", "depends_on"}
+    unexpected_fields = set(value) - allowed_fields
+    if unexpected_fields:
+        raise ValueError(
+            "Planner response contains unexpected fields: "
+            + ", ".join(sorted(unexpected_fields))
+        )
+    queries = value.get("queries")
+    if isinstance(queries, list) and queries:
+        if len(queries) != 1:
+            return {"queries": queries}
+        first = queries[0]
+        if isinstance(first, dict) and "q1" in first and "query" not in first:
+            first = {
+                "id": "q1",
+                "query": first["q1"],
+                "depends_on": first.get("depends_on", [])
+            }
+        elif isinstance(first, str):
+            first = {"id": "q1", "query": first, "depends_on": []}
+        return {"queries": [first]}
+    if isinstance(queries, dict):
+        query_text = queries.get("query") or queries.get("q1")
+        depends_on = queries.get("depends_on", [])
+    else:
+        query_text = value.get("query") or value.get("q1")
+        if not query_text and isinstance(queries, str):
+            query_text = queries
+        depends_on = value.get("depends_on", [])
+    if not isinstance(query_text, str):
+        raise ValueError("Planner response does not contain a string query")
+    return {
+        "queries": [
+            {
+                "id": "q1",
+                "query": query_text,
+                "depends_on": depends_on
+            }
+        ]
+    }
+
+
 def _usage_dict(response: Any) -> dict[str, int]:
     """Extract token usage from an OpenAI-compatible response.
 
@@ -90,7 +156,7 @@ class QueryRewriter:
         content = response.choices[0].message.content
         if not isinstance(content, str):
             raise ValueError("Query model returned non-text content")
-        value = validate_planner_plan(content)
+        value = validate_planner_plan(_normalize_single_query_plan(content))
         if len(value["queries"]) != 1 or value["queries"][0]["depends_on"]:
             raise ValueError("Query model must return exactly one independent query")
         return QueryPlan(

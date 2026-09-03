@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +33,38 @@ class FakeEmbeddings:
             data = [SimpleNamespace(index = 0, embedding = [1.0, 0.0])],
             usage = SimpleNamespace(total_tokens = 1)
         )
+
+
+def test_retrieval_import_does_not_load_torch() -> None:
+    """Keep online FAISS retrieval isolated from PyTorch's OpenMP runtime."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import retrieval.hybrid_retriever; print('torch' in sys.modules)"
+        ],
+        check = True,
+        capture_output = True,
+        text = True
+    )
+
+    assert result.stdout.strip() == "False"
+
+
+def test_rag_cli_import_does_not_load_torch() -> None:
+    """Keep the complete online CLI isolated from PyTorch's OpenMP runtime."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import retrieval.run_rag; print('torch' in sys.modules)"
+        ],
+        check = True,
+        capture_output = True,
+        text = True
+    )
+
+    assert result.stdout.strip() == "False"
 
 
 def make_store(tmp_path: Path) -> Path:
@@ -127,6 +160,23 @@ def test_hybrid_search_returns_channel_provenance(tmp_path) -> None:
     assert hits[0].query_ids == ["q1"]
     assert any(hit.bm25_rank is not None for hit in hits)
     assert all(hit.embedding_rank is not None for hit in hits)
+
+
+def test_hybrid_search_displays_tqdm_progress_when_enabled(tmp_path, capsys) -> None:
+    """Report BM25, embedding, and RRF completion without polluting stdout."""
+    retriever = HybridRetriever(
+        namespace_root = make_store(tmp_path),
+        embedding_client = SimpleNamespace(embeddings = FakeEmbeddings()),
+        candidate_k = 3,
+        show_progress = True
+    )
+
+    retriever.search("Universal Credit claim", top_k = 2)
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "Hybrid retrieval" in captured.err
+    assert "3/3" in captured.err
 
 
 def test_search_many_fuses_resolved_query_steps(tmp_path) -> None:

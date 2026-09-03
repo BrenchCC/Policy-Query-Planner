@@ -11,13 +11,31 @@ from openai import OpenAI
 sys.path.append(os.getcwd())
 
 from data_preprocess.config import PROCESSED_ROOT
-from embedding.build_embedding_store import load_local_environment
 from retrieval.hybrid_retriever import HybridRetriever
 from retrieval.rag_pipeline import AnswerGenerator, QueryRewriter, RAGPipeline
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_VECTOR_ROOT = PROCESSED_ROOT / "vector_store"
+
+
+def load_local_environment(environment_path: Path) -> None:
+    """Load dotenv-style values without importing the PyTorch build path.
+
+    Args:
+        environment_path: Local ignored environment file.
+    """
+    if not environment_path.exists():
+        return
+    for raw_line in environment_path.read_text(encoding = "utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.removeprefix("export ").split("=", 1)
+        name = name.strip()
+        value = value.strip().strip("\"'")
+        if name and value:
+            os.environ.setdefault(name, value)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -65,7 +83,7 @@ def main() -> None:
     load_local_environment(project_root / ".env")
     llm_client = OpenAI(
         api_key = _required_environment("LLM_API_KEY"),
-        base_url = _required_environment("LLM_API_BASE_URL"),
+        base_url = _required_environment("LLM_BASE_URL"),
         timeout = 300.0,
         max_retries = 2
     )
@@ -78,7 +96,8 @@ def main() -> None:
     retriever = HybridRetriever(
         namespace_root = args.vector_store_root / args.namespace,
         embedding_client = embedding_client,
-        candidate_k = args.candidate_k
+        candidate_k = args.candidate_k,
+        show_progress = True
     )
     pipeline = RAGPipeline(
         retriever = retriever,
